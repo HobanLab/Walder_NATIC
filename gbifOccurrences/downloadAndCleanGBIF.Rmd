@@ -651,9 +651,3 @@ if (length(missing_spp) > 0) {
   log_msg("All ", length(species_list), " input species have records in the final output")
 }
 ```
-
-# Session info
-
-```{r session-info}
-sessionInfo()
-```
