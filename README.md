@@ -2,7 +2,7 @@
 This repository stroes the scripts used for the Walder North American Tree Indicator Calculations (NATIC) project.
 
 Currently, these scripts are divided based on functionality: one set of script (`gbifOccurrences`) is used for 
-cleaning and downloading species occurrences from [GBIF](), and writing these to CSVs (to be used for "automatic"
+cleaning and downloading species occurrences from [GBIF](https://www.gbif.org/), and writing these to CSVs (to be used for "automatic"
 genetic indicator assessments). The other set (`densityEstimates`) outlines different approaches for estimating 
 the densities of different North American tree species (using different available datasets).
 
