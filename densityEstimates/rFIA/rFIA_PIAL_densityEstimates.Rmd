@@ -1,0 +1,102 @@
+---
+title: "rFIA_PIAL-Demo"
+output: html_notebook
+---
+
+This is an an [R Markdown](http://rmarkdown.rstudio.com) Notebook documenting the usage of the [rFIA](https://doserlab.com/files/rfia/) package being used to extract density estimates for a certain species of tree, *Pinus albicaulis* (PIAL).
+
+Begin by loading the rFIA package and subsetting to strictly the states of interest (here, states with known native distributions of PIAL). Note that these steps wiil only work if the necessary rFIA data has been downloaded prior to this point.
+
+```{r}
+# Load library and navgiate to directory with rFIA data stored in it.
+library(rFIA)
+fiaDir <- '/RAID1/FIA_Data/allData' ; setwd(fiaDir)
+# Subset entire rFIA database to strictly the states of interest (here, states with known PIAL populations)
+PIAL <- readFIA(dir=fiaDir, states=c('CA','OR','WA','NV','ID','MT','WY'))
+# Clip data to only most recent inventory year
+PIAL_MR <- clipFIA(PIAL, mostRecent = TRUE)
+```
+
+Now, for each state, generate a density estimate (trees per acre, or TPA) for that state using the most recent (MR) data. We then also convert that estimate to trees per kilometer squared (TPKM values).
+
+```{r stateDemos, echo=TRUE}
+# California density
+PIAL_CA <- readFIA(dir=fiaDir, states=c('CA'))
+# Clip data to only most recent inventory year, then get density estimate
+PIAL_CA <- clipFIA(PIAL_CA, mostRecent = TRUE)
+PIAL_CA_TPA <- tpa(PIAL_CA, totals = TRUE, bySpecies = TRUE)
+CA_TPA <- as.numeric(PIAL_CA_TPA[which(PIAL_CA_TPA$COMMON_NAME=='whitebark pine'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+CA_TPKM <- CA_TPA/0.00404686 ; paste0('CA TPA: ', CA_TPA, '; CA TPKM: ', CA_TPKM)
+
+# Oregon density
+PIAL_OR <- readFIA(dir=fiaDir, states=c('OR'))
+# Clip data to only most recent inventory year, then get density estimate
+PIAL_OR <- clipFIA(PIAL_OR, mostRecent = TRUE)
+PIAL_OR_TPA <- tpa(PIAL_OR, totals = TRUE, bySpecies = TRUE)
+OR_TPA <- as.numeric(PIAL_OR_TPA[which(PIAL_OR_TPA$COMMON_NAME=='whitebark pine'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+OR_TPKM <- OR_TPA/0.00404686 ; paste0('OR TPA: ', OR_TPA, '; OR TPKM: ', OR_TPKM)
+
+# Washington density
+PIAL_WA <- readFIA(dir=fiaDir, states=c('WA'))
+# Clip data to only most recent inventory year, then get density estimate
+PIAL_WA <- clipFIA(PIAL_WA, mostRecent = TRUE)
+PIAL_WA_TPA <- tpa(PIAL_WA, totals = TRUE, bySpecies = TRUE)
+WA_TPA <- as.numeric(PIAL_WA_TPA[which(PIAL_WA_TPA$COMMON_NAME=='whitebark pine'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+WA_TPKM <- WA_TPA/0.00404686 ; paste0('WA TPA: ', WA_TPA, '; WA TPKM: ', WA_TPKM)
+
+# Washington density
+PIAL_WA <- readFIA(dir=fiaDir, states=c('WA'))
+# Clip data to only most recent inventory year, then get density estimate
+PIAL_WA <- clipFIA(PIAL_WA, mostRecent = TRUE)
+PIAL_WA_TPA <- tpa(PIAL_WA, totals = TRUE, bySpecies = TRUE)
+WA_TPA <- as.numeric(PIAL_WA_TPA[which(PIAL_WA_TPA$COMMON_NAME=='whitebark pine'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+WA_TPKM <- WA_TPA/0.00404686 ; paste0('WA TPA: ', WA_TPA, '; WA TPKM: ', WA_TPKM)
+
+# Idaho density
+PIAL_ID <- readFIA(dir=fiaDir, states=c('ID'))
+# Clip data to only most recent inventory year, then get density estimate
+PIAL_ID <- clipFIA(PIAL_ID, mostRecent = TRUE)
+PIAL_ID_TPA <- tpa(PIAL_ID, totals = TRUE, bySpecies = TRUE)
+ID_TPA <- as.numeric(PIAL_ID_TPA[which(PIAL_ID_TPA$COMMON_NAME=='whitebark pine'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+ID_TPKM <- ID_TPA/0.00404686 ; paste0('ID TPA: ', ID_TPA, '; ID TPKM: ', ID_TPKM)
+
+# Montana density
+PIAL_MT <- readFIA(dir=fiaDir, states=c('MT'))
+# Clip data to only most recent inventory year, then get density estimate
+PIAL_MT <- clipFIA(PIAL_MT, mostRecent = TRUE)
+PIAL_MT_TPA <- tpa(PIAL_MT, totals = TRUE, bySpecies = TRUE)
+MT_TPA <- as.numeric(PIAL_MT_TPA[which(PIAL_MT_TPA$COMMON_NAME=='whitebark pine'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+MT_TPKM <- MT_TPA/0.00404686 ; paste0('MT TPA: ', MT_TPA, '; MT TPKM: ', MT_TPKM)
+
+# Wyoming density
+PIAL_WY <- readFIA(dir=fiaDir, states=c('WY'))
+# Clip data to only most recent inventory year, then get density estimate
+PIAL_WY <- clipFIA(PIAL_WY, mostRecent = TRUE)
+PIAL_WY_TPA <- tpa(PIAL_WY, totals = TRUE, bySpecies = TRUE)
+WY_TPA <- as.numeric(PIAL_WY_TPA[which(PIAL_WY_TPA$COMMON_NAME=='whitebark pine'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+WY_TPKM <- WY_TPA/0.00404686 ; paste0('WY TPA: ', WY_TPA, '; WY TPKM: ', WY_TPKM)
+
+```
+Finally, one of the GFS populations appear to lie half within TN and half within NC. For that population, calculate the average of the two density estimates from those states.
+
+```{r echo=TRUE}
+# Average of WA and ID TPKMs
+mean(WA_TPKM, ID_TPKM)
+```
+
+```{r echo=TRUE}
+# Average of OR and ID TPKMs
+mean(OR_TPKM, ID_TPKM)
+```
+
+```{r echo=TRUE}
+# Average of MT and WY TPKMs
+mean(MT_TPKM, WY_TPKM)
+```

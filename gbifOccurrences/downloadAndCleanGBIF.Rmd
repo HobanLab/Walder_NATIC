@@ -1,0 +1,659 @@
+---
+title: "GBIF Occurrence Download & CoordinateCleaner QC Pipeline"
+author: "Austin Koontz"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, message = TRUE, warning = TRUE)
+```
+
+# Overview
+
+This document walks through the pipeline used to download and clean occurrence records from the
+[Global Biodiversity Information Facility (GBIF)](https://www.gbif.org/).
+The pipeline has two major phases:
+
+1. **Download** — submit a single server-side request to GBIF covering all
+   target species, restricted to specified countries (currently, North America:
+   U.S., Canada, Mexico, and the Caribbean), the specified years (currently, 1975–2025), 
+   georeferenced records only, and excluding fossils and ex situ (botanical garden / zoo) specimens.
+2. **Clean** — apply the
+   [CoordinateCleaner](https://ropensci.github.io/CoordinateCleaner/)
+   package's suite of record-level and dataset-level quality tests to flag
+   and remove problematic occurrences.
+
+The pipeline is designed to run unattended in the background (on a Linux
+server). Expensive stages are checkpointed to `.rds` files so that a
+re-run skips any stage whose checkpoint already exists. Parallelization
+(via the `future` / `furrr` packages) is used for the three most
+computationally expensive steps: geographic outlier detection (`cc_outl`),
+degree-minute conversion error detection (`cd_ddmm`), and rasterized
+sampling detection (`cd_round`).
+
+**Note**: even after running this script, it's worth checking the resulting occurrences to make sure they've
+been filtered correctly. From testing, ex situ and other aberrant occurrences can still remain for a species
+even after it's been filtered using this script.
+
+## GBIF credentials
+
+`occ_download()` requires a free
+[GBIF account](https://www.gbif.org/user/profile). Store your credentials
+once in your `.Renviron` so they are picked up automatically:
+
+```r
+usethis::edit_r_environ()
+# Add these three lines, save, and restart R:
+# GBIF_USER=your_username
+# GBIF_PWD=your_password
+# GBIF_EMAIL=your_email@example.com
+```
+
+# Setup
+
+## Load packages
+
+```{r packages}
+pacman::p_load(rgbif, taxize, CoordinateCleaner, dplyr, countrycode,
+               readr, purrr, tibble, future, furrr)
+```
+
+## Parameters
+
+Key parameters that control the scope of the download and the strictness
+of cleaning are set here so they can be adjusted in one place.
+
+- **`species_file`**: a single-column CSV of species scientific names (no header).
+- **`year_range`**: only occurrences recorded between these years are
+  downloaded.
+- **`countries`**: ISO 3166-1 alpha-2 codes defining the geographic scope.
+  The list below covers the U.S., Canada, Mexico, and Caribbean nations
+  and territories.
+- **`coord_uncertainty_km`**: maximum acceptable coordinate uncertainty.
+  Records reporting uncertainty above this threshold are removed. The
+  [CoordinateCleaner tutorial](https://ropensci.github.io/CoordinateCleaner/articles/Cleaning_GBIF_data_with_CoordinateCleaner.html)
+  uses 100 km for a global macroecological grain; for range-scale or
+  species-level conservation genetics work, 10 km is a more appropriate
+  starting point.
+
+```{r parameters}
+setwd('/home/akoontz/Documents/Indicators/Walder_Indicators/Scripts/GBIF_occurrences/')
+species_file <- "speciesLists/SpeciesList_2026-08-20_40n_MexicanSpecies.csv"
+out_dir      <- "gbif_clean_output"
+dir.create(out_dir, showWarnings = FALSE)
+
+year_range <- c(1975, 2025)
+
+countries <- c(
+  "US", "CA", "MX",
+  "AG", "BS", "BB", "CU", "DM", "DO", "GD", "HT", "JM", "KN",
+  "LC", "VC", "TT", "AI", "AW", "BQ", "VG", "KY", "CW", "GP",
+  "MQ", "MS", "PR", "SX", "TC", "VI"
+)
+
+coord_uncertainty_km <- 10
+```
+
+## Parallel plan and logging
+
+The parallel plan is conservative by design: it uses fewer workers than
+available cores to leave headroom on a shared server and avoid
+memory-exhaustion crashes on spatial workloads. `plan(multicore)` uses
+fork-based parallelism (Linux only); on Windows or inside RStudio, use
+`plan(multisession)` instead.
+
+```{r parallel-and-logging}
+N_WORKERS <- min(18, future::availableCores() - 2)
+plan(multicore, workers = N_WORKERS)
+FORCE_RERUN <- FALSE
+
+log_msg <- function(...) {
+  message(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "), ...)
+}
+script_start <- Sys.time()
+pdf(NULL)
+log_msg("=== Pipeline started (", N_WORKERS, " parallel workers) ===")
+```
+
+# Read species list
+
+The input is a simple CSV with one species name per row and no header.
+
+```{r read-species}
+species_list <- read_csv(species_file, col_names = "species", show_col_types = FALSE) %>%
+  pull(species) %>%
+  trimws() %>%
+  unique()
+log_msg(length(species_list), " species read from ", species_file)
+```
+
+# Match names to the GBIF backbone taxonomy {#backbone}
+
+Each input name is matched to the
+[GBIF Backbone Taxonomy](https://www.gbif.org/dataset/d7dddbf4-2cf0-4f39-9b2a-bb099caae36c)
+using `name_backbone_checklist()`. This returns a `usageKey` — a unique
+numeric identifier — for each name. Names that cannot be matched
+(`matchType` of `"NONE"` or `"HIGHERRANK"`) are written to
+`unmatched_names.csv` for manual review.
+
+An important detail: GBIF's `taxonKey` occurrence filter automatically
+includes records filed under synonyms of a matched accepted name. So once
+a species is matched to its accepted backbone key, the download in the
+next step already captures records that were originally filed under
+older or alternate names — no extra synonym-handling step is needed for
+the download itself.
+
+```{r backbone-match}
+log_msg("Matching ", length(species_list), " names to GBIF backbone...")
+
+backbone <- name_backbone_checklist(species_list)
+
+unmatched <- backbone %>% filter(matchType %in% c("NONE", "HIGHERRANK"))
+if (nrow(unmatched) > 0) {
+  log_msg(nrow(unmatched), " names did not cleanly match the GBIF backbone; see unmatched_names.csv")
+  write_csv(unmatched, file.path(out_dir, "unmatched_names.csv"))
+}
+
+accepted <- backbone %>% filter(matchType %in% c("EXACT", "FUZZY"))
+
+log_msg(nrow(accepted), " of ", length(species_list),
+        " species matched to a GBIF backbone accepted usage")
+```
+
+# Enumerate synonyms (documentation only)
+
+Although GBIF's download filter already folds synonyms in automatically,
+this step explicitly enumerates each species' known synonyms and writes
+them to `synonym_mapping.csv`. This serves as documentation: it provides
+a record of exactly which alternate names were folded into each query,
+which is useful for reproducibility and for understanding why a species'
+occurrence count might be higher than expected.
+
+Two sources are checked:
+
+1. **GBIF's own backbone** (primary) — via `name_usage(data = "synonyms")`.
+   This is the same taxonomy that drives the download, so it is authoritative.
+2. **Kew's Plants of the World Online** (optional cross-check) — via
+   `taxize::synonyms(db = "pow")`. This external API is known to
+   rate-limit or block programmatic access (HTTP 403/429/502), so the
+   call is wrapped in `tryCatch` and failures are silently skipped.
+
+```{r enumerate-synonyms}
+get_gbif_synonyms <- function(key) {
+  tryCatch({
+    syn <- name_usage(key = key, data = "synonyms")$data
+    if (is.null(syn) || nrow(syn) == 0) return(character(0))
+    unique(syn$canonicalName[!is.na(syn$canonicalName)])
+  }, error = function(e) character(0))
+}
+
+get_pow_synonyms_optional <- function(sp) {
+  tryCatch({
+    syn_df <- taxize::synonyms(sp, db = "pow")[[1]]
+    if (is.null(syn_df) || !is.data.frame(syn_df) || nrow(syn_df) == 0) return(character(0))
+    name_col <- intersect(c("name", "fullName", "scientificName"), names(syn_df))[1]
+    if (is.na(name_col)) return(character(0))
+    unique(as.character(syn_df[[name_col]]))
+  }, error = function(e) character(0))
+}
+
+log_msg("Enumerating synonyms for ", nrow(accepted), " species (", N_WORKERS, " workers)...")
+
+synonym_table <- accepted %>%
+  select(species = verbatim_name, usageKey) %>%
+  mutate(
+    gbif_synonyms = future_map(usageKey, get_gbif_synonyms, .progress = FALSE),
+    pow_synonyms  = future_map(species, get_pow_synonyms_optional, .progress = FALSE)
+  )
+
+synonym_report <- synonym_table %>%
+  mutate(
+    gbif_synonyms = map_chr(gbif_synonyms, ~ paste(.x, collapse = "; ")),
+    pow_synonyms  = map_chr(pow_synonyms, ~ paste(.x, collapse = "; "))
+  )
+write_csv(synonym_report, file.path(out_dir, "synonym_mapping.csv"))
+
+gbif_keys <- unique(accepted$usageKey)
+log_msg(length(gbif_keys), " unique GBIF accepted taxon keys will be queried ",
+        "(synonym occurrences are included automatically by GBIF's taxonKey filter)")
+```
+
+# Download occurrences from GBIF
+
+The download is submitted as a single server-side job via `occ_download()`.
+This is preferable to `occ_search()` or `occ_data()` for several reasons:
+
+- **No record-count cap**: `occ_search()` is limited to 100,000 records
+  per call; `occ_download()` has no such limit.
+- **Citable DOI**: each download receives a DOI that should be cited in
+  any resulting publication.
+- **Reproducibility**: the download is logged on GBIF's servers and can be
+  re-accessed later.
+
+The following server-side filters are applied:
+
+| Filter | Purpose |
+|--------|---------|
+| `taxonKey` | Restrict to the matched species (synonyms included automatically) |
+| `country` | Restrict to North America + Caribbean |
+| `year` | 1975–2025 |
+| `hasCoordinate = TRUE` | Only georeferenced records |
+| `hasGeospatialIssue = FALSE` | Exclude records GBIF has flagged for geospatial problems |
+| `basisOfRecord ≠ FOSSIL_SPECIMEN, LIVING_SPECIMEN` | Exclude fossils and ex situ (zoo/garden) specimens |
+
+This step is **checkpointed**: if the `GBIF_occurrences_raw.rds` file already
+exists, the download is skipped and the cached data is loaded instead.
+
+```{r gbif-download}
+raw_rds <- file.path(out_dir, "GBIF_occurrences_raw.rds")
+
+if (file.exists(raw_rds) && !FORCE_RERUN) {
+
+  log_msg("Found existing raw download at ", raw_rds, " -- loading from disk (skipping GBIF download)")
+  dat_raw <- readRDS(raw_rds)
+
+} else {
+
+  download_key <- occ_download(
+    pred_in("taxonKey", gbif_keys),
+    pred_in("country", countries),
+    pred_gte("year", year_range[1]),
+    pred_lte("year", year_range[2]),
+    pred("hasCoordinate", TRUE),
+    pred("hasGeospatialIssue", FALSE),
+    pred_not(pred_in("basisOfRecord", c("FOSSIL_SPECIMEN", "LIVING_SPECIMEN"))),
+    format = "SIMPLE_CSV"
+  )
+
+  log_msg("Download submitted: ", download_key,
+          " -- waiting for GBIF to prepare it (status printed every 60s)...")
+
+  occ_download_wait(download_key, status_ping = 60, quiet = FALSE)
+
+  dl_path <- occ_download_get(download_key, path = out_dir, overwrite = TRUE)
+  dat_raw <- occ_download_import(dl_path)
+
+  log_msg(nrow(dat_raw), " raw occurrence records downloaded")
+
+  saveRDS(dat_raw, raw_rds)
+
+  writeLines(format(gbif_citation(dl_path)), file.path(out_dir, "gbif_citation.txt"))
+}
+```
+
+## Identify synonym renames
+
+GBIF labels every downloaded record with its **accepted** species name,
+not necessarily the name that was queried. If an input name is treated as
+a synonym by GBIF's backbone, its records will appear under a different
+name in the `species` column. This step detects those cases by comparing
+the input species list against the names actually present in the download,
+and traces each "extra" accepted name back to the input synonym via
+shared `usageKey` values.
+
+The resulting `name_lookup` table is used later to label output CSV
+filenames with both the original input name and the GBIF accepted name
+(e.g., `Hesperocyparis_forbesii_Cupressus_arizonica_123n_2026-08-20.csv`).
+
+```{r synonym-lookup}
+gbif_species <- unique(dat_raw$species)
+extra_species <- setdiff(gbif_species, species_list)
+missing_input <- setdiff(species_list, gbif_species)
+
+name_lookup <- tibble(input_name = character(), gbif_name = character())
+if (length(extra_species) > 0 && length(missing_input) > 0) {
+  extra_keys <- map_dfr(extra_species, function(sp) {
+    bb <- name_backbone(name = sp, kingdom = "Plantae")
+    tibble(gbif_name = sp, key = bb$usageKey)
+  })
+  input_keys <- accepted %>%
+    transmute(input_name = verbatim_name, key = usageKey)
+  name_lookup <- inner_join(input_keys, extra_keys, by = "key") %>%
+    filter(input_name != gbif_name) %>%
+    select(input_name, gbif_name) %>%
+    distinct()
+}
+
+if (nrow(name_lookup) > 0) {
+  log_msg(nrow(name_lookup), " input names are synonyms in GBIF's backbone:")
+  for (i in seq_len(nrow(name_lookup))) {
+    log_msg("  ", name_lookup$input_name[i], " -> ", name_lookup$gbif_name[i])
+  }
+}
+```
+
+# Prepare data for cleaning
+
+Before running `CoordinateCleaner`, the raw download is trimmed to the
+columns needed for cleaning, records lacking coordinates are dropped,
+and country codes are converted from ISO 3166-1 alpha-2 (as GBIF provides
+them) to alpha-3 (as `cc_coun()` requires).
+
+A stable `row_id` column is added to allow parallel chunk results to be
+realigned with the full table after processing.
+
+```{r prepare-data}
+dat <- dat_raw %>%
+  select(species, decimalLongitude, decimalLatitude, countryCode,
+         individualCount, gbifID, family, taxonRank,
+         coordinateUncertaintyInMeters, year, basisOfRecord,
+         institutionCode, datasetKey) %>%
+  filter(!is.na(decimalLongitude), !is.na(decimalLatitude))
+
+dat$countryCode <- countrycode(dat$countryCode, origin = "iso2c", destination = "iso3c")
+
+dat <- as.data.frame(dat)
+dat$row_id <- seq_len(nrow(dat))
+
+log_msg(nrow(dat), " records ready for cleaning")
+```
+
+# CoordinateCleaner: record-level tests
+
+The [CoordinateCleaner](https://ropensci.github.io/CoordinateCleaner/)
+package provides a suite of automated tests for flagging common problems
+in species occurrence coordinates. Each `cc_*` function removes records 
+that fail its test. The tests, in order:
+
+| Function | What it flags |
+|----------|---------------|
+| `cc_val()` | Invalid coordinates (outside valid lat/lon range) |
+| `cc_equ()` | Identical latitude and longitude (often a data-entry error) |
+| `cc_cap()` | Coordinates matching country or province capitals |
+| `cc_cen()` | Coordinates matching country or province centroids |
+| `cc_coun()` | Coordinates that fall outside the stated country |
+| `cc_sea()` | Coordinates that fall in the ocean |
+| `cc_zero()` | Coordinates at (0, 0) — the "null island" default |
+| `cc_dupl()` | Exact duplicate records (same species, same coordinates) |
+
+```{r cc-record-level}
+log_msg("Running record-level CoordinateCleaner tests...")
+
+clean <- dat %>%
+  cc_val() %>%
+  cc_equ() %>%
+  cc_cap() %>%
+  cc_cen() %>%
+  cc_coun(iso3 = "countryCode") %>%
+  cc_sea() %>%
+  cc_zero() %>%
+  cc_dupl()
+
+log_msg(nrow(dat) - nrow(clean), " records removed by record-level tests; ", nrow(clean), " remaining")
+```
+
+## Geographic outlier detection (`cc_outl`)
+
+`cc_outl()` flags records that are statistical geographic outliers
+relative to the other records for the same species. Unlike the tests
+above, this one operates **per species** (it computes pairwise distances
+among each species' points), which makes it both the most expensive
+record-level test and a good candidate for parallelization.
+
+The species list is split into chunks, and each chunk is processed by a
+separate worker. Because `cc_outl()` treats each species independently,
+splitting by species and recombining gives identical results to running
+the full table at once.
+
+This step is **checkpointed**: if `cc_outl_flags.rds` already exists, the
+saved flags are loaded instead of re-computing.
+
+```{r cc-outl}
+outl_rds <- file.path(out_dir, "cc_outl_flags.rds")
+
+if (file.exists(outl_rds) && !FORCE_RERUN) {
+
+  log_msg("Found existing cc_outl() flags at ", outl_rds, " -- loading from disk")
+  outl_flags <- readRDS(outl_rds)
+
+} else {
+
+  log_msg("Running cc_outl() across ", length(unique(clean$species)),
+          " species (", N_WORKERS, " workers)...")
+
+  species_chunks <- split(unique(clean$species),
+                          cut(seq_along(unique(clean$species)), N_WORKERS, labels = FALSE))
+
+  outl_results <- future_map(species_chunks, function(sp_chunk) {
+    sub <- clean[clean$species %in% sp_chunk, ]
+    flags <- cc_outl(sub, species = "species", value = "flagged", verbose = FALSE)
+    tibble(row_id = sub$row_id, outl_flag = flags)
+  }, .progress = FALSE)
+
+  outl_flags <- bind_rows(outl_results) %>% arrange(row_id)
+  saveRDS(outl_flags, outl_rds)
+}
+
+clean <- clean %>%
+  left_join(outl_flags, by = "row_id") %>%
+  filter(outl_flag) %>%
+  select(-outl_flag)
+
+log_msg(nrow(clean), " records remaining after cc_outl()")
+```
+
+# Coordinate precision filter
+
+Records with very high coordinate uncertainty are unlikely to be useful
+for downstream spatial analyses. This step removes any record whose
+reported `coordinateUncertaintyInMeters` exceeds the threshold set in
+the parameters above (`coord_uncertainty_km` km).
+
+Records with **no** reported uncertainty (`NA`) are retained, following
+the convention in the
+[CoordinateCleaner tutorial](https://ropensci.github.io/CoordinateCleaner/articles/Cleaning_GBIF_data_with_CoordinateCleaner.html).
+These should be inspected separately if coordinate precision matters for
+the downstream analysis.
+
+```{r precision-filter}
+clean <- clean %>%
+  filter(is.na(coordinateUncertaintyInMeters) |
+           (coordinateUncertaintyInMeters / 1000) <= coord_uncertainty_km)
+
+log_msg(nrow(clean), " records remaining after precision filter (<= ",
+        coord_uncertainty_km, " km)")
+```
+
+# CoordinateCleaner: dataset-level tests
+
+Unlike the record-level tests above, these two tests evaluate patterns
+across entire **datasets** (identified by `datasetKey`). They flag whole
+datasets rather than individual records, so their diagnostic reports
+(written to CSV) should be reviewed manually before accepting the
+automatic filtering.
+
+## Degree-minute conversion errors (`cd_ddmm`)
+
+`cd_ddmm()` tests whether a dataset's coordinate distribution is
+consistent with a systematic "dd.mm → dd.dd" conversion error — a common
+data-entry mistake where degree-minute values are incorrectly recorded as
+decimal degrees (e.g., 45°30′ entered as 45.30° instead of 45.50°).
+
+## Rasterized sampling (`cd_round`)
+
+`cd_round()` tests whether a dataset's coordinates show an
+unusually regular lattice pattern, which can indicate that points were
+assigned to grid-cell centroids rather than actual sampling locations.
+
+Both tests are parallelized by splitting datasets across workers (never
+splitting a single dataset's records, which would break the
+within-dataset statistics). All four calls (`cd_ddmm` diagnostic/flagged,
+`cd_round` diagnostic/flagged) are wrapped in `tryCatch` because
+`cd_ddmm()` can fail on datasets with very few records (its internal
+`binom.test()` receives invalid inputs). When a chunk fails, its records
+are conservatively kept (flagged as `TRUE`).
+
+This step is **checkpointed**: if `dataset_level_flags.rds` already
+exists, the saved flags are loaded.
+
+```{r dataset-level-tests}
+dataset_rds <- file.path(out_dir, "dataset_level_flags.rds")
+
+if (file.exists(dataset_rds) && !FORCE_RERUN) {
+
+  log_msg("Found existing dataset-level flags at ", dataset_rds, " -- loading from disk")
+  saved <- readRDS(dataset_rds)
+  ddmm_report  <- saved$ddmm_report
+  round_report <- saved$round_report
+  ddmm_flags   <- saved$ddmm_flags
+  round_flags  <- saved$round_flags
+
+} else {
+
+  log_msg("Running cd_ddmm() and cd_round() across ", length(unique(clean$datasetKey)),
+          " datasets (", N_WORKERS, " workers)...")
+
+  dataset_ids <- unique(clean$datasetKey)
+  dataset_chunks <- split(dataset_ids,
+                          cut(seq_along(dataset_ids), N_WORKERS, labels = FALSE))
+
+  chunk_results <- future_map(dataset_chunks, function(ds_chunk) {
+    sub <- clean[clean$datasetKey %in% ds_chunk, ]
+
+    ddmm_ds <- tryCatch({
+      res <- cd_ddmm(sub, lon = "decimalLongitude", lat = "decimalLatitude",
+                      ds = "datasetKey", diagnostic = TRUE, diff = 1, value = "dataset")
+      tibble::rownames_to_column(res, var = "datasetKey")
+    }, error = function(e) {
+      message("  cd_ddmm() failed for a chunk (", length(ds_chunk), " datasets): ", conditionMessage(e))
+      NULL
+    })
+    ddmm_fl <- tryCatch({
+      cd_ddmm(sub, lon = "decimalLongitude", lat = "decimalLatitude",
+              ds = "datasetKey", diff = 1, value = "flagged")
+    }, error = function(e) rep(TRUE, nrow(sub)))
+
+    round_ds <- tryCatch({
+      cd_round(sub, lon = "decimalLongitude", lat = "decimalLatitude",
+               ds = "datasetKey", T1 = 7, value = "dataset", graphs = FALSE)
+    }, error = function(e) {
+      message("  cd_round() failed for a chunk (", length(ds_chunk), " datasets): ", conditionMessage(e))
+      NULL
+    })
+    round_fl <- tryCatch({
+      cd_round(sub, lon = "decimalLongitude", lat = "decimalLatitude",
+               ds = "datasetKey", T1 = 7, value = "flagged", graphs = FALSE)
+    }, error = function(e) rep(TRUE, nrow(sub)))
+
+    list(
+      ddmm_report  = ddmm_ds,
+      round_report = round_ds,
+      flags        = tibble(row_id = sub$row_id, ddmm_flag = ddmm_fl, round_flag = round_fl)
+    )
+  }, .progress = FALSE)
+
+  ddmm_report  <- bind_rows(map(chunk_results, "ddmm_report"))
+  round_report <- bind_rows(map(chunk_results, "round_report"))
+  flags_all    <- bind_rows(map(chunk_results, "flags")) %>% arrange(row_id)
+  ddmm_flags   <- flags_all$ddmm_flag
+  round_flags  <- flags_all$round_flag
+
+  write_csv(ddmm_report, file.path(out_dir, "ddmm_conversion_flags_by_dataset.csv"))
+  write_csv(round_report, file.path(out_dir, "rasterized_sampling_flags_by_dataset.csv"))
+
+  saveRDS(list(ddmm_report = ddmm_report, round_report = round_report,
+               ddmm_flags = ddmm_flags, round_flags = round_flags),
+          dataset_rds)
+}
+
+clean_final <- clean[ddmm_flags & round_flags, ]
+
+log_msg(nrow(clean) - nrow(clean_final),
+        " records removed for belonging to a flagged dataset (ddmm/rasterized tests)")
+log_msg(nrow(clean_final), " final cleaned records")
+```
+
+# Save outputs
+
+Cleaned records are written to one CSV per species in
+`gbif_clean_output/species_csvs/`. Column names `decimalLongitude` and
+`decimalLatitude` are lowercased to `decimallongitude` and
+`decimallatitude` for compatibility with downstream tools.
+
+For species where GBIF's accepted name differs from the input name
+(synonym cases identified [above](#backbone)), the output filename
+includes both names:
+`InputName_AcceptedName_Nn_YYYY-MM-DD.csv`.
+
+```{r save-outputs}
+clean_final <- clean_final %>%
+  select(-row_id) %>%
+  rename(decimallongitude = decimalLongitude, decimallatitude = decimalLatitude)
+
+species_dir <- file.path(out_dir, "species_csvs")
+dir.create(species_dir, showWarnings = FALSE)
+
+for (sp in unique(clean_final$species)) {
+  sp_data <- clean_final[clean_final$species == sp, ]
+
+  input_match <- name_lookup$input_name[name_lookup$gbif_name == sp]
+  if (length(input_match) == 1 && input_match != sp) {
+    file_prefix <- paste0(gsub(" ", "_", input_match), "_", gsub(" ", "_", sp))
+  } else {
+    file_prefix <- gsub(" ", "_", sp)
+  }
+
+  sp_file <- file.path(species_dir, paste0(file_prefix, "_", nrow(sp_data), "n_",
+                                           format(Sys.Date(), "%Y-%m-%d"), ".csv"))
+  write_csv(sp_data, sp_file)
+}
+
+elapsed <- round(difftime(Sys.time(), script_start, units = "mins"), 1)
+log_msg("=== Done in ", elapsed, " minutes. Cleaned data written to: ",
+        species_dir, " (one CSV per species) ===")
+```
+
+# Reconciliation: missing species
+
+Not every input species will necessarily have records in the final output.
+This section identifies which species are missing and diagnoses why, by
+checking whether they were present at each stage of the pipeline.
+
+Species whose input name was a synonym (and whose records appear under
+GBIF's accepted name) are excluded from the "missing" count — they do
+have output, just under a different filename.
+
+```{r reconciliation}
+synonym_inputs <- name_lookup$input_name[name_lookup$gbif_name %in% unique(clean_final$species)]
+missing_spp <- setdiff(species_list, c(unique(clean_final$species), synonym_inputs))
+if (length(missing_spp) > 0) {
+  log_msg(length(missing_spp), " species from the input list have no final output:")
+  missing_info <- tibble(species = missing_spp) %>%
+    mutate(
+      in_gbif_download  = species %in% unique(dat_raw$species),
+      after_cc_records   = species %in% unique(dat$species),
+      after_cc_pipeline = species %in% unique(clean$species),
+      after_precision   = species %in% unique(clean_final$species)
+    )
+  for (i in seq_len(nrow(missing_info))) {
+    row <- missing_info[i, ]
+    if (!row$in_gbif_download) {
+      reason <- "no records returned by GBIF download (may be a synonym; check synonym_mapping.csv)"
+    } else if (!row$after_cc_records) {
+      reason <- "all records lacked coordinates"
+    } else if (!row$after_cc_pipeline) {
+      reason <- "all records removed by CoordinateCleaner tests (cc_val/cc_equ/.../cc_outl)"
+    } else {
+      reason <- "all records removed by precision or dataset-level filters"
+    }
+    log_msg("  - ", row$species, ": ", reason)
+  }
+  write_csv(missing_info, file.path(out_dir, "species_missing_from_output.csv"))
+} else {
+  log_msg("All ", length(species_list), " input species have records in the final output")
+}
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

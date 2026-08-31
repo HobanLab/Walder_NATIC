@@ -1,0 +1,193 @@
+---
+title: "Wilson2013_DensityEstimates"
+author: "Austin Koontz"
+date: "2026-05-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This notebook documents the usage of the [Wilson et al. 2013](https://www.fs.usda.gov/rds/archive/catalog/RDS-2013-0013#:%05:text=Live%20tree%20species%20basal%20area%20of%20the%20contiguous%20United%20States) dataset along with the [rFIA](https://doserlab.com/files/rfia/) package to calculate densities for tree species across the contiguous United States.
+
+## Explanation
+The Wilson et al. 2013 dataset provides a dataset of live tree basal area (i.e. tree cross-sectional area) for North American trees in the 
+contiguous U.S. This dataset covers all forested lands across the contiguous United States, not just U.S. Forest Service lands. 
+
+From this basal area data, it's possible to calculate the densities of tree species across the continental United States by using the Quadratic Mean Diameter (QMD): the diameter of the "average" tree (for a given species), weighted by basal area (meaning larger trees count more than smaller ones). This QMD value can be derived from the basal area per acre (BAa) and trees per acre (TPA) values for each species in the FIA dataset, using the formula below:
+$$
+QMD = \sqrt{\frac{BAa}{0.005454 \times TPA_{FIA}}}
+$$
+Once the QMD value is calculated for each species, the basal area **for a single tree** (BAt) can be calculated from it:
+$$
+BAt = 0.005454 \times QMD^2
+$$
+
+Finally, once we have both the basal area for each acre (given in the Wilson et al. 2013 dataset) and the basal area for each tree (from the FIA data), we can use this to calculate the number of trees per acre using the formula below:
+$$
+TPA_{National} = \frac{BAa}{BAt}
+$$
+**Note**: the difference between the TPA variable in the top equation and the TPA in the bottom equation is that the FIA TPA is based on data _solely_ from USFS FIA plots. The TPA from the Wilson et al. 2013 dataset corresponds to densities at the continental scale, for each species.
+
+**Note**: Because the Wilson et al. 2013 dataset reports mean basal area across all sampled hexagons in the contiguous U.S., rare or geographically restricted species (e.g. Fraser fir) have continental-scale average basal areas very close to zero. Therefore, this density data is most useful for common, widespread species.
+
+## Overview
+Before we utilize the data from Wilson et al. 2013, we need to clean it. Specifically: the metrics (including basal area per acre) for each species are separated into 3 spreadsheets (CSVs): one containing values for species in the western U.S., one containing values for species in the eastern U.S., and one containing values for species over the entire country (but at a resolution of 200 km). To get the most accurate BAa values for *all* species, we need to extract rows from each of the 3 CSVs and then `rbind` them together into a final composite dataset; the steps to do that are below.
+
+**Note**: the dividing line between "western" and "eastern" are determined by the dataset authors; for a more complete understanding of the materials in this dataset, check out the [file index](https://www.fs.usda.gov/rds/archive/products/RDS-2013-0013/_fileindex_RDS-2013-0013.html).
+
+## Workflow
+Begin by loading the necessary R packages, specifying the directory which stores the rFIA data, and specifying the path to the directory containing the data from Wilson et al. 2013.
+```{r Initialize, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+pacman::p_load(readr, dplyr, rFIA)
+# Specify FIA directory, and directory of Wilson et al. 2013 data
+fiaDir <- '/RAID1/FIA_Data/allData' ; setwd(fiaDir)
+wilsonDir <- '/home/akoontz/Documents/Indicators/Walder_Indicators/RDS-2013-0013_Data/'
+```
+
+### Data Cleaning
+Read in the 3 CSVs. Note that these all contain the same number of rows (324)--but we won't retain all of these, since some are ambiguous (e.g. "spp.", "NA", "Unknown conifer", etc.) 
+```{r Read in Wilson, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+western_half <- read_csv(paste0(wilsonDir, "agreement_metrics_western_half.csv"))
+eastern_half <- read_csv(paste0(wilsonDir, "agreement_metrics_eastern_half.csv"))
+k200 <-  read_csv(paste0(wilsonDir, "agreement_metrics_200k.csv"))
+```
+```{r}
+lapply(list(western_half, eastern_half, k200), nrow)
+```
+We start by identifying the species which have nonzero values in the "western" dataset and zero values in the "eastern" dataset. For those species, we want to use the average basal area per acre values (labeled `Avg_ba`, in this data) from the western metrics CSV.
+```{r westCalc, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+# Species names of western nonzero species
+W_species <- western_half %>%
+  filter(Avg_ba != 0) %>%
+  pull('Common Name')
+# Species names of eastern zero species
+E_zero_species <- eastern_half %>%
+  filter(Avg_ba == 0) %>%
+  pull('Common Name')
+# Intersect the two
+W_species <- intersect(W_species, E_zero_species)
+wilsonWest <- western_half %>% filter('Common Name' %in% W_species)
+# Remove these species from eastern half
+eastern_half_filtered <- eastern_half %>%
+  filter(!'Common Name' %in% W_species)
+```
+Next, we do the same thing but for the eastern species.
+```{r eastCalc, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+# Species names of eastern nonzero species
+E_species <- eastern_half %>%
+  filter(Avg_ba != 0) %>%
+  pull('Common Name')
+# Species names of western zero species
+W_zero_species <- western_half %>%
+  filter(Avg_ba == 0) %>%
+  pull('Common Name')
+# Intersect the two
+E_species <- intersect(E_species, W_zero_species)
+wilsonEast <- eastern_half %>%  filter('Common Name' %in% E_species)
+# Remove these species from western half
+western_half_filtered <- western_half %>%
+  filter(!'Common Name' %in% E_species)
+```
+Next, we need to process the species that span the western-eastern division--we use the basal area values from the `200 km` dataset for this. We find the species with nonzero values in that dataset, and which are unrepresented in both our western and eastern datasets.
+```{r totalCalc, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+# Create a set of species with nonzero values in 200km dataset, and which aren't present in western/eastern sets
+excluded_species <- union(W_species, E_species)
+total <- k200 %>% filter(Avg_ba != 0, !'Common Name' %in% excluded_species)
+```
+Finally, we combine the western, eastern, and total datasets into final dataframe, and any remove duplicates (although note, from checking, there don't appear to be any). The final `tibble` has 287 rows, meaning we've lost 37 species in the process; from inspection, at least 31 of these have `Avg_ba` values of 0 in all 3 datasets.
+```{r combineTibbles, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+final_df <- bind_rows(wilsonWest, wilsonEast, total)
+final_df <- final_df %>%  distinct()
+# There are 287 rows in the final dataframe
+nrow(final_df)
+# Write results to disc
+write_csv(final_df, paste0(wilsonDir, 'processedMetrics.csv'))
+```
+
+### Data Analysis
+We start by reading in the CSV we just wrote to disc, which is a composite of the 3 CSVs originally provided in the Wilson et al. 2013 dataset.
+```{r, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+inputData <- paste0(wilsonDir, 'processedMetrics.csv')
+usfs <- invisible(read_csv(inputData, col_names = TRUE))
+```
+```{r}
+head(usfs)
+```
+Next, specify the subset of the FIA data to utilize. These are `rFIA` commands which allow us to prepare the appropriate subset of the FIA dataset.
+
+```{r Read in FIA, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+# Extract FIA data for contiguous U.S.
+contigUS <- c("WA","OR","CA","ID","MT","WY","CO","NM","AZ","UT","NV",
+              "ND","SD","NE","KS","OK","TX","MN","IA","MO","AR","LA",
+              "WI","IL","MI","IN","OH","KY","TN","MS","AL","GA","FL",
+              "SC","NC","VA","WV","PA","NY","VT","NH","ME","MA","CT",
+              "RI","NJ","DE","MD")
+fia <- readFIA(dir = fiaDir, states = contigUS, tables = c("TREE","COND","PLOT"),
+               inMemory = FALSE)
+```
+We need to first calculate the Quadratic Mean Diameter (QMD) from the FIA data. We do this using the basal area per acre (BAA) and trees per area (TPA) variables within the FIA dataset.
+```{r Calculate QMD}
+qmd <- tpa(
+  fia,
+  bySpecies = TRUE,
+  landType = "forest",
+  treeType = "live",
+  totals = FALSE
+) %>%
+  mutate(
+    QMD = sqrt(BAA / (0.005454 * TPA))
+  ) %>%
+  select(SPCD, TPA, BAA, QMD)
+```
+
+The tibble generated above contains multiple QMD values per species. Before combining these with the basal area per acre values
+provided in the Wilson et al. 2013 dataset (`usfs`), we need to average QMD values by species.
+```{r Average QMD across species}
+qmd2 <- qmd %>%
+  group_by(SPCD) %>%
+  summarize(
+    TPA = mean(TPA, na.rm=TRUE),
+    BAA = mean(BAA, na.rm=TRUE),
+    QMD = mean(QMD, na.rm=TRUE)
+  )
+```
+Now that we have our QMD tibble, we combine it with the data from Wilson et al. 2013.
+```{r Combine datasets}
+combined <- left_join(usfs,  qmd2,  by = c("Spp code" = "SPCD"))
+```
+Finally, using this `combined` dataset, we calculate the basal area per tree (`BA_tree`) by converting the derived `QMD` value (second equation above). Then, we divide basal area per acre (from Wilson et al. 2013) by average basal area per tree (from FIA data) to get trees per acre (third equation above).
+```{r Calculate BA_tree and final TPA}
+combined <- combined %>%
+  mutate(
+    BA_tree = 0.005454 * QMD^2,
+    Trees_per_acre = Avg_ba / BA_tree
+  )
+```
+Finally, we check out the outputs and write the resulting TPA data to a CSV. Note the differences in TPA values below.
+```{r Generate output CSV}
+# Examine outputs: species name, FIA TPA, and TPA calculated based on Wilson et al. 2013 data
+finalDensities <- combined[,c(1,2,3,5,41,45)] ; print(finalDensities)
+
+# Write CSV, to output density values per species
+write.table(finalDensities, file=paste0(wilsonDir,'calculatedTPAs.csv'),sep=',')
+```
+
+## Species Overlap Check
+The code below is for checking the level of overlap in species between the Wilson et al. 2013 dataset and the FIA dataset.
+```{r Species overlap code, echo=TRUE, results='hide', warning=FALSE, message=FALSE}
+# Determine how many (and which) species overlap between the FIA dataset and the Wilson et al. 2013 dataset
+# Create species lookup table
+species_lookup <- distinct(usfs[, c("Spp code", "Scientific Name")])
+# Capture overlapping species codes
+overlap <- intersect(
+  unique(qmd2$SPCD),
+  unique(usfs$`Spp code`)
+)
+# Generate list of overlapping species with names
+overlap_species <- species_lookup[species_lookup$`Spp code` %in% overlap,]
+overlap_species <- overlap_species[order(overlap_species$`Spp code`),]
+nrow(overlap_species)
+overlap_species$`Scientific name`
+```

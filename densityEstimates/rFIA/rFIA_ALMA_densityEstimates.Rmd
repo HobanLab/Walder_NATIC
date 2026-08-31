@@ -1,0 +1,65 @@
+---
+title: "rFIA_ALMA-Demo"
+output: html_notebook
+---
+
+This is an an [R Markdown](http://rmarkdown.rstudio.com) Notebook documenting the usage of the [rFIA](https://doserlab.com/files/rfia/) package being used to extract density estimates for a certain species of tree, *Alnus maritima* (ALMA).
+
+Begin by loading the rFIA package and subsetting to strictly the states of interest (here, states with known native distributions of ALMA). Note that these steps will only work if the necessary rFIA data has been downloaded prior to this point.
+
+```{r}
+# Load library and navgiate to directory with rFIA data stored in it.
+library(rFIA)
+fiaDir <- '/RAID1/FIA_Data/allData' ; setwd(fiaDir)
+# Subset entire rFIA database to strictly the states of interest (here, states with known ALMA populations)
+ALMA <- readFIA(dir=fiaDir, states=c('GA','OK', 'MA', 'DE'))
+# Clip data to only most recent inventory year
+ALMA_MR <- clipFIA(ALMA, mostRecent = TRUE)
+```
+
+Now, for each state, generate a density estimate (trees per acre, or TPA) for that state using the most recent (MR) data. We then also convert that estimate to trees per kilometer squared (TPKM values).
+
+```{r stateDemos, echo=TRUE}
+# Georgia density
+ALMA_GA <- readFIA(dir=fiaDir, states=c('GA'))
+# Clip data to only most recent inventory year, then get density estimate
+ALMA_GA <- clipFIA(ALMA_GA, mostRecent = TRUE)
+ALMA_GA_TPA <- tpa(ALMA_GA, totals = TRUE, bySpecies = TRUE)
+GA_TPA <- as.numeric(ALMA_GA_TPA[which(ALMA_GA_TPA$COMMON_NAME=='Seaside alder'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+GA_TPKM <- GA_TPA/0.00404686 ; paste0('GA TPA: ', GA_TPA, '; GA TPKM: ', GA_TPKM)
+
+# Oklahoma density
+ALMA_OK <- readFIA(dir=fiaDir, states=c('OK'))
+# Clip data to only most recent inventory year, then get density estimate
+ALMA_OK <- clipFIA(ALMA_OK, mostRecent = TRUE)
+ALMA_OK_TPA <- tpa(ALMA_OK, totals = TRUE, bySpecies = TRUE)
+OK_TPA <- as.numeric(ALMA_OK_TPA[which(ALMA_OK_TPA$COMMON_NAME=='Seaside alder'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+OK_TPKM <- OK_TPA/0.00404686 ; paste0('OK TPA: ', OK_TPA, '; OK TPKM: ', OK_TPKM)
+
+# Maryland density
+ALMA_MA <- readFIA(dir=fiaDir, states=c('MA'))
+# Clip data to only most recent inventory year, then get density estimate
+ALMA_MA <- clipFIA(ALMA_MA, mostRecent = TRUE)
+ALMA_MA_TPA <- tpa(ALMA_MA, totals = TRUE, bySpecies = TRUE)
+MA_TPA <- as.numeric(ALMA_MA_TPA[which(ALMA_MA_TPA$COMMON_NAME=='Seaside alder'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+MA_TPKM <- MA_TPA/0.00404686 ; paste0('MA TPA: ', MA_TPA, '; MA TPKM: ', MA_TPKM)
+
+# Delaware density
+ALDE_DE <- readFIA(dir=fiaDir, states=c('DE'))
+# Clip data to only most recent inventory year, then get density estiDEte
+ALDE_DE <- clipFIA(ALDE_DE, mostRecent = TRUE)
+ALDE_DE_TPA <- tpa(ALDE_DE, totals = TRUE, bySpecies = TRUE)
+DE_TPA <- as.numeric(ALDE_DE_TPA[which(ALDE_DE_TPA$COMMON_NAME=='Seaside alder'),5])
+# Calculate density in trees per km2, and report both trees per acre and trees per km2
+DE_TPKM <- DE_TPA/0.00404686 ; paste0('DE TPA: ', DE_TPA, '; DE TPKM: ', DE_TPKM)
+```
+
+Finally, one of the GFS populations appear to lie half within MA and half within DE. For that population, calculate the average of the two density estimates from those states.
+
+```{r echo=TRUE}
+# Average of TN and NC TPKMs
+mean(MA_TPKM, DE_TPKM)
+```
