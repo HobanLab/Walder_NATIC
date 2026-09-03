@@ -11,7 +11,7 @@
 
 <meta name="author" content="Austin Koontz" />
 
-<meta name="date" content="2026-08-31" />
+<meta name="date" content="2026-09-03" />
 
 <title>GBIF Occurrence Download &amp; CoordinateCleaner QC Pipeline</title>
 
@@ -1588,7 +1588,7 @@ border-radius: 0px;
 <h1 class="title toc-ignore">GBIF Occurrence Download &amp;
 CoordinateCleaner QC Pipeline</h1>
 <h4 class="author">Austin Koontz</h4>
-<h4 class="date">August 31, 2026</h4>
+<h4 class="date">September 03, 2026</h4>
 
 </div>
 
@@ -1596,32 +1596,24 @@ CoordinateCleaner QC Pipeline</h1>
 <div id="overview" class="section level1" number="1">
 <h1><span class="header-section-number">1</span> Overview</h1>
 <p>This document walks through the pipeline used to download and clean
-occurrence records from the <a href="https://www.gbif.org/">Global
-Biodiversity Information Facility (GBIF)</a>. The pipeline has two major
-phases:</p>
+plant species occurrence records from the <a href="https://www.gbif.org/">Global Biodiversity Information Facility
+(GBIF)</a>. The pipeline has two major phases:</p>
 <ol style="list-style-type: decimal">
 <li><strong>Download</strong> — submit a single server-side request to
-GBIF covering all target species, restricted to specified countries
-(currently, North America: U.S., Canada, Mexico, and the Caribbean), the
-specified years (currently, 1975–2025), georeferenced records only, and
-excluding fossils and ex situ (botanical garden / zoo) specimens.</li>
+GBIF covering all target species, restricted to North America (U.S.,
+Canada, Mexico, and the Caribbean), the years 1975–2025, georeferenced
+records only, and excluding fossils and ex situ (botanical garden / zoo)
+specimens.</li>
 <li><strong>Clean</strong> — apply the <a href="https://ropensci.github.io/CoordinateCleaner/">CoordinateCleaner</a>
 package’s suite of record-level and dataset-level quality tests to flag
-and remove problematic occurrences.</li>
+and remove problematic occurrences, along with a geoprivacy filter that
+removes records whose coordinates were intentionally obscured by the
+data provider.</li>
 </ol>
-<p>The pipeline is designed to run unattended in the background (on a
-Linux server). Expensive stages are checkpointed to <code>.rds</code>
-files so that a re-run skips any stage whose checkpoint already exists.
-Parallelization (via the <code>future</code> / <code>furrr</code>
-packages) is used for the three most computationally expensive steps:
-geographic outlier detection (<code>cc_outl</code>), degree-minute
-conversion error detection (<code>cd_ddmm</code>), and rasterized
-sampling detection (<code>cd_round</code>).</p>
-<p><strong>Note</strong>: even after running this script, it’s worth
-checking the resulting occurrences to make sure they’ve been filtered
-correctly. From testing, ex situ and other aberrant occurrences can
-still remain for a species even after it’s been filtered using this
-script.</p>
+<p>The pipeline is designed to run unattended in the background on a
+Linux server. Expensive stages are checkpointed to <code>.rds</code>
+files so that a re-run skips any stage whose checkpoint already exists,
+and certain steps are parallelized.</p>
 <div id="gbif-credentials" class="section level2" number="1.1">
 <h2><span class="header-section-number">1.1</span> GBIF credentials</h2>
 <p><code>occ_download()</code> requires a free <a href="https://www.gbif.org/user/profile">GBIF account</a>. Store your
@@ -1638,95 +1630,78 @@ automatically:</p>
 <h1><span class="header-section-number">2</span> Setup</h1>
 <div id="load-packages" class="section level2" number="2.1">
 <h2><span class="header-section-number">2.1</span> Load packages</h2>
-<pre class="r"><code>pacman::p_load(rgbif, taxize, CoordinateCleaner, dplyr, countrycode,
+<pre class="r"><code>pacman::p_load(rgbif, taxize, CoordinateCleaner, dplyr, countrycode, 
                readr, purrr, tibble, future, furrr)</code></pre>
 </div>
 <div id="parameters" class="section level2" number="2.2">
 <h2><span class="header-section-number">2.2</span> Parameters</h2>
-<p>Key parameters that control the scope of the download and the
-strictness of cleaning are set here so they can be adjusted in one
-place.</p>
-<ul>
-<li><strong><code>species_file</code></strong>: a single-column CSV of
-species scientific names (no header).</li>
-<li><strong><code>year_range</code></strong>: only occurrences recorded
-between these years are downloaded.</li>
-<li><strong><code>countries</code></strong>: ISO 3166-1 alpha-2 codes
-defining the geographic scope. The list below covers the U.S., Canada,
-Mexico, and Caribbean nations and territories.</li>
-<li><strong><code>coord_uncertainty_km</code></strong>: maximum
-acceptable coordinate uncertainty. Records reporting uncertainty above
-this threshold are removed. The <a href="https://ropensci.github.io/CoordinateCleaner/articles/Cleaning_GBIF_data_with_CoordinateCleaner.html">CoordinateCleaner
-tutorial</a> uses 100 km for a global macroecological grain; for
-range-scale or species-level conservation genetics work, 10 km is a more
-appropriate starting point.</li>
-</ul>
-<pre class="r"><code>setwd(&#39;/home/akoontz/Documents/Indicators/Walder_Indicators/Scripts/GBIF_occurrences/&#39;)
-species_file &lt;- &quot;speciesLists/SpeciesList_2026-08-20_40n_MexicanSpecies.csv&quot;
+<p>Key parameters are set here. <code>coord_uncertainty_km</code> sets
+the maximum acceptable coordinate uncertainty; <a href="https://ropensci.github.io/CoordinateCleaner/articles/Cleaning_GBIF_data_with_CoordinateCleaner.html">CoordinateCleaner</a>
+uses 100 km, but for this project 10 km is used.</p>
+<pre class="r"><code>setwd(&#39;/home/akoontz/Documents/Indicators/Walder_Indicators/Code/gbifOccurrences/&#39;)
+species_file &lt;- &quot;speciesLists/SpeciesList_2026-08-20_40n_MexicanSpecies.csv&quot;   # one species name per row, no header
 out_dir      &lt;- &quot;gbif_clean_output&quot;
 dir.create(out_dir, showWarnings = FALSE)
-
 year_range &lt;- c(1975, 2025)
 
+# North America: US, Canada, Mexico + Caribbean (ISO 3166-1 alpha-2 codes)
 countries &lt;- c(
-  &quot;US&quot;, &quot;CA&quot;, &quot;MX&quot;,
-  &quot;AG&quot;, &quot;BS&quot;, &quot;BB&quot;, &quot;CU&quot;, &quot;DM&quot;, &quot;DO&quot;, &quot;GD&quot;, &quot;HT&quot;, &quot;JM&quot;, &quot;KN&quot;,
-  &quot;LC&quot;, &quot;VC&quot;, &quot;TT&quot;, &quot;AI&quot;, &quot;AW&quot;, &quot;BQ&quot;, &quot;VG&quot;, &quot;KY&quot;, &quot;CW&quot;, &quot;GP&quot;,
+  &quot;US&quot;, &quot;CA&quot;, &quot;MX&quot;,                                            # US, Canada, Mexico
+  &quot;AG&quot;, &quot;BS&quot;, &quot;BB&quot;, &quot;CU&quot;, &quot;DM&quot;, &quot;DO&quot;, &quot;GD&quot;, &quot;HT&quot;, &quot;JM&quot;, &quot;KN&quot;,   # Caribbean nations
+  &quot;LC&quot;, &quot;VC&quot;, &quot;TT&quot;, &quot;AI&quot;, &quot;AW&quot;, &quot;BQ&quot;, &quot;VG&quot;, &quot;KY&quot;, &quot;CW&quot;, &quot;GP&quot;,   # + territories
   &quot;MQ&quot;, &quot;MS&quot;, &quot;PR&quot;, &quot;SX&quot;, &quot;TC&quot;, &quot;VI&quot;
 )
-
+# Max acceptable coordinate uncertainty, in km. For range-scale/species-level work,
+# a much tighter value like 1-10 km is usually more appropriate.
 coord_uncertainty_km &lt;- 10</code></pre>
 </div>
 <div id="parallel-plan-and-logging" class="section level2" number="2.3">
 <h2><span class="header-section-number">2.3</span> Parallel plan and
 logging</h2>
-<p>The parallel plan is conservative by design: it uses fewer workers
-than available cores to leave headroom on a shared server and avoid
-memory-exhaustion crashes on spatial workloads.
-<code>plan(multicore)</code> uses fork-based parallelism (Linux only);
-on Windows or inside RStudio, use <code>plan(multisession)</code>
-instead.</p>
-<pre class="r"><code>N_WORKERS &lt;- min(18, future::availableCores() - 2)
-plan(multicore, workers = N_WORKERS)
-FORCE_RERUN &lt;- FALSE
+<p>This section sets up the number of cores to used for future
+parallelized steps.</p>
+<pre class="r"><code># ---- PARALLEL PLAN ---------------------------------------------------------------
+# Specify number of workers (low number, to leave space on the server)
+N_WORKERS &lt;- min(18, future::availableCores() - 2)
+plan(multicore, workers = N_WORKERS)   # fork-based parallelization; Linux only
+FORCE_RERUN &lt;- FALSE   # set TRUE to ignore existing checkpoints and redo everything
 
+# ---- Logging helper ---------------------------------------------------------------
 log_msg &lt;- function(...) {
   message(format(Sys.time(), &quot;[%Y-%m-%d %H:%M:%S] &quot;), ...)
 }
 script_start &lt;- Sys.time()
-pdf(NULL)
+pdf(NULL)   # suppress default Rplots.pdf when running non-interactively
 log_msg(&quot;=== Pipeline started (&quot;, N_WORKERS, &quot; parallel workers) ===&quot;)</code></pre>
 </div>
 </div>
 <div id="read-species-list" class="section level1" number="3">
 <h1><span class="header-section-number">3</span> Read species list</h1>
-<p>The input is a simple CSV with one species name per row and no
-header.</p>
+<p>The input is a single-column CSV with one species scientific name per
+row and no header.</p>
 <pre class="r"><code>species_list &lt;- read_csv(species_file, col_names = &quot;species&quot;, show_col_types = FALSE) %&gt;%
   pull(species) %&gt;%
   trimws() %&gt;%
   unique()
 log_msg(length(species_list), &quot; species read from &quot;, species_file)</code></pre>
 </div>
-<div id="backbone" class="section level1" number="4">
+<div id="match-names-to-the-gbif-backbone-taxonomy" class="section level1" number="4">
 <h1><span class="header-section-number">4</span> Match names to the GBIF
 backbone taxonomy</h1>
 <p>Each input name is matched to the <a href="https://www.gbif.org/dataset/d7dddbf4-2cf0-4f39-9b2a-bb099caae36c">GBIF
-Backbone Taxonomy</a> using <code>name_backbone_checklist()</code>. This
-returns a <code>usageKey</code> — a unique numeric identifier — for each
-name. Names that cannot be matched (<code>matchType</code> of
-<code>&quot;NONE&quot;</code> or <code>&quot;HIGHERRANK&quot;</code>) are written to
+Backbone Taxonomy</a> via <code>name_backbone_checklist()</code>, which
+returns a numeric <code>usageKey</code> for each name. Names that cannot
+be matched (<code>matchType</code> of <code>&quot;NONE&quot;</code> or
+<code>&quot;HIGHERRANK&quot;</code>) are written to
 <code>unmatched_names.csv</code> for manual review.</p>
-<p>An important detail: GBIF’s <code>taxonKey</code> occurrence filter
-automatically includes records filed under synonyms of a matched
-accepted name. So once a species is matched to its accepted backbone
-key, the download in the next step already captures records that were
-originally filed under older or alternate names — no extra
-synonym-handling step is needed for the download itself.</p>
+<p>GBIF’s <code>taxonKey</code> occurrence filter automatically includes
+records filed under synonyms of a matched accepted name, so no extra
+synonym-handling is needed for the download itself.</p>
 <pre class="r"><code>log_msg(&quot;Matching &quot;, length(species_list), &quot; names to GBIF backbone...&quot;)
 
 backbone &lt;- name_backbone_checklist(species_list)
 
+# If there are any unmatched names, write these to a CSV
 unmatched &lt;- backbone %&gt;% filter(matchType %in% c(&quot;NONE&quot;, &quot;HIGHERRANK&quot;))
 if (nrow(unmatched) &gt; 0) {
   log_msg(nrow(unmatched), &quot; names did not cleanly match the GBIF backbone; see unmatched_names.csv&quot;)
@@ -1741,23 +1716,17 @@ log_msg(nrow(accepted), &quot; of &quot;, length(species_list),
 <div id="enumerate-synonyms-documentation-only" class="section level1" number="5">
 <h1><span class="header-section-number">5</span> Enumerate synonyms
 (documentation only)</h1>
-<p>Although GBIF’s download filter already folds synonyms in
-automatically, this step explicitly enumerates each species’ known
-synonyms and writes them to <code>synonym_mapping.csv</code>. This
-serves as documentation: it provides a record of exactly which alternate
-names were folded into each query, which is useful for reproducibility
-and for understanding why a species’ occurrence count might be higher
-than expected.</p>
-<p>Two sources are checked:</p>
+<p>Although GBIF’s download filter folds synonyms in automatically, this
+step explicitly enumerates each species’ known synonyms and writes them
+to <code>synonym_mapping.csv</code> for reproducibility. Two sources are
+checked:</p>
 <ol style="list-style-type: decimal">
 <li><strong>GBIF’s own backbone</strong> (primary) — via
-<code>name_usage(data = &quot;synonyms&quot;)</code>. This is the same taxonomy
-that drives the download, so it is authoritative.</li>
+<code>name_usage(data = &quot;synonyms&quot;)</code>.</li>
 <li><strong>Kew’s Plants of the World Online</strong> (optional
-cross-check) — via <code>taxize::synonyms(db = &quot;pow&quot;)</code>. This
-external API is known to rate-limit or block programmatic access (HTTP
-403/429/502), so the call is wrapped in <code>tryCatch</code> and
-failures are silently skipped.</li>
+cross-check) — via <code>taxize::synonyms(db = &quot;pow&quot;)</code>, wrapped in
+<code>tryCatch</code> since this external API is known to block
+programmatic access.</li>
 </ol>
 <pre class="r"><code>get_gbif_synonyms &lt;- function(key) {
   tryCatch({
@@ -1801,18 +1770,10 @@ log_msg(length(gbif_keys), &quot; unique GBIF accepted taxon keys will be querie
 <h1><span class="header-section-number">6</span> Download occurrences
 from GBIF</h1>
 <p>The download is submitted as a single server-side job via
-<code>occ_download()</code>. This is preferable to
-<code>occ_search()</code> or <code>occ_data()</code> for several
-reasons:</p>
-<ul>
-<li><strong>No record-count cap</strong>: <code>occ_search()</code> is
-limited to 100,000 records per call; <code>occ_download()</code> has no
-such limit.</li>
-<li><strong>Citable DOI</strong>: each download receives a DOI that
-should be cited in any resulting publication.</li>
-<li><strong>Reproducibility</strong>: the download is logged on GBIF’s
-servers and can be re-accessed later.</li>
-</ul>
+<code>occ_download()</code>. This produces a citable DOI. The download
+uses the Darwin Core Archive (<code>DWCA</code>) format so the
+<code>dataGeneralizations</code> and <code>informationWithheld</code>
+fields are available for the geoprivacy filter in the next step.</p>
 <p>The following server-side filters are applied:</p>
 <table>
 <colgroup>
@@ -1828,12 +1789,11 @@ servers and can be re-accessed later.</li>
 <tbody>
 <tr class="odd">
 <td><code>taxonKey</code></td>
-<td>Restrict to the matched species (synonyms included
-automatically)</td>
+<td>Restrict to matched species (synonyms included automatically)</td>
 </tr>
 <tr class="even">
 <td><code>country</code></td>
-<td>Restrict to North America + Caribbean</td>
+<td>North America + Caribbean</td>
 </tr>
 <tr class="odd">
 <td><code>year</code></td>
@@ -1849,22 +1809,22 @@ automatically)</td>
 </tr>
 <tr class="even">
 <td><code>basisOfRecord ≠ FOSSIL_SPECIMEN, LIVING_SPECIMEN</code></td>
-<td>Exclude fossils and ex situ (zoo/garden) specimens</td>
+<td>Exclude fossils and ex situ specimens</td>
 </tr>
 </tbody>
 </table>
-<p>This step is <strong>checkpointed</strong>: if the
-<code>GBIF_occurrences_raw.rds</code> file already exists, the download
-is skipped and the cached data is loaded instead.</p>
+<p>This step is <strong>checkpointed</strong>: if
+<code>GBIF_occurrences_raw.rds</code> already exists, the download is
+skipped and cached data is loaded instead.</p>
 <pre class="r"><code>raw_rds &lt;- file.path(out_dir, &quot;GBIF_occurrences_raw.rds&quot;)
 
 if (file.exists(raw_rds) &amp;&amp; !FORCE_RERUN) {
-
+  
   log_msg(&quot;Found existing raw download at &quot;, raw_rds, &quot; -- loading from disk (skipping GBIF download)&quot;)
   dat_raw &lt;- readRDS(raw_rds)
-
+  
 } else {
-
+  
   download_key &lt;- occ_download(
     pred_in(&quot;taxonKey&quot;, gbif_keys),
     pred_in(&quot;country&quot;, countries),
@@ -1872,45 +1832,48 @@ if (file.exists(raw_rds) &amp;&amp; !FORCE_RERUN) {
     pred_lte(&quot;year&quot;, year_range[2]),
     pred(&quot;hasCoordinate&quot;, TRUE),
     pred(&quot;hasGeospatialIssue&quot;, FALSE),
-    pred_not(pred_in(&quot;basisOfRecord&quot;, c(&quot;FOSSIL_SPECIMEN&quot;, &quot;LIVING_SPECIMEN&quot;))),
-    format = &quot;SIMPLE_CSV&quot;
+    pred_not(pred_in(&quot;basisOfRecord&quot;, c(&quot;FOSSIL_SPECIMEN&quot;, &quot;LIVING_SPECIMEN&quot;))),  # exclude fossils and ex situ (zoo/garden) specimens
+    format = &quot;DWCA&quot;
   )
-
   log_msg(&quot;Download submitted: &quot;, download_key,
           &quot; -- waiting for GBIF to prepare it (status printed every 60s)...&quot;)
-
+  
+  # status_ping controls how often occ_download_wait() polls and prints status,
+  # so background progress is visible in run_log.txt
   occ_download_wait(download_key, status_ping = 60, quiet = FALSE)
-
   dl_path &lt;- occ_download_get(download_key, path = out_dir, overwrite = TRUE)
   dat_raw &lt;- occ_download_import(dl_path)
-
   log_msg(nrow(dat_raw), &quot; raw occurrence records downloaded&quot;)
-
   saveRDS(dat_raw, raw_rds)
-
+  # Save the citation 
   writeLines(format(gbif_citation(dl_path)), file.path(out_dir, &quot;gbif_citation.txt&quot;))
 }</code></pre>
 <div id="identify-synonym-renames" class="section level2" number="6.1">
 <h2><span class="header-section-number">6.1</span> Identify synonym
 renames</h2>
 <p>GBIF labels every downloaded record with its
-<strong>accepted</strong> species name, not necessarily the name that
-was queried. If an input name is treated as a synonym by GBIF’s
-backbone, its records will appear under a different name in the
-<code>species</code> column. This step detects those cases by comparing
-the input species list against the names actually present in the
-download, and traces each “extra” accepted name back to the input
-synonym via shared <code>usageKey</code> values.</p>
-<p>The resulting <code>name_lookup</code> table is used later to label
-output CSV filenames with both the original input name and the GBIF
-accepted name (e.g.,
-<code>Hesperocyparis_forbesii_Cupressus_arizonica_123n_2026-08-20.csv</code>).</p>
-<pre class="r"><code>gbif_species &lt;- unique(dat_raw$species)
-extra_species &lt;- setdiff(gbif_species, species_list)
-missing_input &lt;- setdiff(species_list, gbif_species)
+<strong>accepted</strong> species name, not the queried name. If an
+input name is a synonym in GBIF’s backbone, its records appear under a
+different name in the <code>species</code> column. This step detects
+those cases and traces each “extra” accepted name back to the input
+synonym via shared <code>usageKey</code> values. The resulting
+<code>name_lookup</code> table is used later to label output filenames
+with both names.</p>
+<pre class="r"><code># Build lookup: input name -&gt; GBIF accepted name, by comparing the input
+# species list against the species names that actually appear in the downloaded
+# data. GBIF&#39;s download labels records with its accepted species name, so any
+# input name that doesn&#39;t appear verbatim in dat_raw$species was a synonym.
+gbif_species &lt;- unique(dat_raw$species)
+extra_species &lt;- setdiff(gbif_species, species_list)   # names in download but not in input
+missing_input &lt;- setdiff(species_list, gbif_species)   # input names not in download (synonym or no records)
 
+# Match each extra (accepted) name back to the input (synonym) name via the
+# backbone&#39;s usageKey: both the input synonym and the accepted name share the
+# same accepted usageKey
 name_lookup &lt;- tibble(input_name = character(), gbif_name = character())
 if (length(extra_species) &gt; 0 &amp;&amp; length(missing_input) &gt; 0) {
+  # For each extra species, look up its usageKey, then find which input name
+  # mapped to the same key
   extra_keys &lt;- map_dfr(extra_species, function(sp) {
     bb &lt;- name_backbone(name = sp, kingdom = &quot;Plantae&quot;)
     tibble(gbif_name = sp, key = bb$usageKey)
@@ -1934,33 +1897,80 @@ if (nrow(name_lookup) &gt; 0) {
 <div id="prepare-data-for-cleaning" class="section level1" number="7">
 <h1><span class="header-section-number">7</span> Prepare data for
 cleaning</h1>
-<p>Before running <code>CoordinateCleaner</code>, the raw download is
-trimmed to the columns needed for cleaning, records lacking coordinates
-are dropped, and country codes are converted from ISO 3166-1 alpha-2 (as
-GBIF provides them) to alpha-3 (as <code>cc_coun()</code> requires).</p>
-<p>A stable <code>row_id</code> column is added to allow parallel chunk
-results to be realigned with the full table after processing.</p>
+<p>The raw download is trimmed to the columns needed for cleaning and
+filtering, and records lacking coordinates are dropped.</p>
 <pre class="r"><code>dat &lt;- dat_raw %&gt;%
   select(species, decimalLongitude, decimalLatitude, countryCode,
          individualCount, gbifID, family, taxonRank,
          coordinateUncertaintyInMeters, year, basisOfRecord,
-         institutionCode, datasetKey) %&gt;%
-  filter(!is.na(decimalLongitude), !is.na(decimalLatitude))
+         institutionCode, datasetKey,
+         dataGeneralizations, informationWithheld) %&gt;%
+  filter(!is.na(decimalLongitude), !is.na(decimalLatitude))</code></pre>
+<div id="geoprivacy-filter" class="section level2" number="7.1">
+<h2><span class="header-section-number">7.1</span> Geoprivacy
+filter</h2>
+<p>Some data providers intentionally obscure, randomize, or generalize
+coordinates for sensitive species. This step uses pattern matching on
+the <code>dataGeneralizations</code> and
+<code>informationWithheld</code> fields to identify and remove such
+records.</p>
+<p>A per-species tally of removed records is written to
+<code>geoprivacy_removed_by_species.csv</code>.</p>
+<pre class="r"><code># %%% 6b. Filter records with obscured/generalized coordinates for geoprivacy ---
+# Matches common phrases data providers use when coordinates have been
+# randomized, generalized, or obscured for sensitive-species protection.
+geoprivacy_pattern &lt;- paste(
+  &quot;coordinate.*obscur&quot;, &quot;coordinate.*generaliz&quot;, &quot;coordinate.*randomiz&quot;,
+  &quot;coordinate.*round&quot;, &quot;coordinate.*truncat&quot;, &quot;coordinate.*alter&quot;,
+  &quot;location.*obscur&quot;, &quot;location.*generaliz&quot;, &quot;location.*randomiz&quot;,
+  &quot;location.*withheld&quot;, &quot;geoprivacy&quot;, &quot;sensitive.*species&quot;,
+  sep = &quot;|&quot;
+)
+dat$geoprivacy_flag &lt;- grepl(geoprivacy_pattern, dat$dataGeneralizations, ignore.case = TRUE) |
+  grepl(geoprivacy_pattern, dat$informationWithheld, ignore.case = TRUE)
 
+geoprivacy_tally &lt;- dat %&gt;%
+  group_by(species) %&gt;%
+  summarise(
+    total_records     = n(),
+    geoprivacy_removed = sum(geoprivacy_flag),
+    .groups = &quot;drop&quot;
+  ) %&gt;%
+  filter(geoprivacy_removed &gt; 0)
+
+if (nrow(geoprivacy_tally) &gt; 0) {
+  log_msg(sum(dat$geoprivacy_flag), &quot; records flagged for geoprivacy coordinate obscuring across &quot;,
+          nrow(geoprivacy_tally), &quot; species&quot;)
+  write_csv(geoprivacy_tally, file.path(out_dir, &quot;geoprivacy_removed_by_species.csv&quot;))
+} else {
+  log_msg(&quot;No records flagged for geoprivacy coordinate obscuring&quot;)
+}
+dat &lt;- dat %&gt;%
+  filter(!geoprivacy_flag) %&gt;%
+  select(-dataGeneralizations, -informationWithheld, -geoprivacy_flag)</code></pre>
+</div>
+<div id="country-code-conversion-and-indexing" class="section level2" number="7.2">
+<h2><span class="header-section-number">7.2</span> Country code
+conversion and indexing</h2>
+<p>Country codes are converted from ISO 3166-1 alpha-2 (as GBIF
+provides) to alpha-3 (as <code>cc_coun()</code> requires), and a stable
+<code>row_id</code> is added for realigning parallel chunk results
+later.</p>
+<pre class="r"><code># ISO2 -&gt; ISO3, required by cc_coun()
 dat$countryCode &lt;- countrycode(dat$countryCode, origin = &quot;iso2c&quot;, destination = &quot;iso3c&quot;)
 
 dat &lt;- as.data.frame(dat)
-dat$row_id &lt;- seq_len(nrow(dat))
+dat$row_id &lt;- seq_len(nrow(dat))   # stable index, used to realign parallel chunk results
 
 log_msg(nrow(dat), &quot; records ready for cleaning&quot;)</code></pre>
+</div>
 </div>
 <div id="coordinatecleaner-record-level-tests" class="section level1" number="8">
 <h1><span class="header-section-number">8</span> CoordinateCleaner:
 record-level tests</h1>
 <p>The <a href="https://ropensci.github.io/CoordinateCleaner/">CoordinateCleaner</a>
-package provides a suite of automated tests for flagging common problems
-in species occurrence coordinates. Each <code>cc_*</code> function
-removes records that fail its test. The tests, in order:</p>
+package provides automated tests for common problems in species
+occurrence coordinates.</p>
 <table>
 <colgroup>
 <col width="40%" />
@@ -2024,131 +2034,93 @@ log_msg(nrow(dat) - nrow(clean), &quot; records removed by record-level tests; &
 <h2><span class="header-section-number">8.1</span> Geographic outlier
 detection (<code>cc_outl</code>)</h2>
 <p><code>cc_outl()</code> flags records that are statistical geographic
-outliers relative to the other records for the same species. Unlike the
-tests above, this one operates <strong>per species</strong> (it computes
-pairwise distances among each species’ points), which makes it both the
-most expensive record-level test and a good candidate for
-parallelization.</p>
-<p>The species list is split into chunks, and each chunk is processed by
-a separate worker. Because <code>cc_outl()</code> treats each species
-independently, splitting by species and recombining gives identical
-results to running the full table at once.</p>
-<p>This step is <strong>checkpointed</strong>: if
-<code>cc_outl_flags.rds</code> already exists, the saved flags are
-loaded instead of re-computing.</p>
+outliers relative to other records for the same species. It operates per
+species (computing pairwise distances). This step is
+<strong>checkpointed</strong> to <code>cc_outl_flags.rds</code>.</p>
 <pre class="r"><code>outl_rds &lt;- file.path(out_dir, &quot;cc_outl_flags.rds&quot;)
 
 if (file.exists(outl_rds) &amp;&amp; !FORCE_RERUN) {
-
   log_msg(&quot;Found existing cc_outl() flags at &quot;, outl_rds, &quot; -- loading from disk&quot;)
   outl_flags &lt;- readRDS(outl_rds)
-
 } else {
-
   log_msg(&quot;Running cc_outl() across &quot;, length(unique(clean$species)),
           &quot; species (&quot;, N_WORKERS, &quot; workers)...&quot;)
 
   species_chunks &lt;- split(unique(clean$species),
                           cut(seq_along(unique(clean$species)), N_WORKERS, labels = FALSE))
-
+  
   outl_results &lt;- future_map(species_chunks, function(sp_chunk) {
     sub &lt;- clean[clean$species %in% sp_chunk, ]
     flags &lt;- cc_outl(sub, species = &quot;species&quot;, value = &quot;flagged&quot;, verbose = FALSE)
     tibble(row_id = sub$row_id, outl_flag = flags)
   }, .progress = FALSE)
-
   outl_flags &lt;- bind_rows(outl_results) %&gt;% arrange(row_id)
   saveRDS(outl_flags, outl_rds)
 }
-
 clean &lt;- clean %&gt;%
   left_join(outl_flags, by = &quot;row_id&quot;) %&gt;%
   filter(outl_flag) %&gt;%
   select(-outl_flag)
-
 log_msg(nrow(clean), &quot; records remaining after cc_outl()&quot;)</code></pre>
 </div>
 </div>
 <div id="coordinate-precision-filter" class="section level1" number="9">
 <h1><span class="header-section-number">9</span> Coordinate precision
 filter</h1>
-<p>Records with very high coordinate uncertainty are unlikely to be
-useful for downstream spatial analyses. This step removes any record
-whose reported <code>coordinateUncertaintyInMeters</code> exceeds the
-threshold set in the parameters above (<code>coord_uncertainty_km</code>
-km).</p>
-<p>Records with <strong>no</strong> reported uncertainty
-(<code>NA</code>) are retained, following the convention in the <a href="https://ropensci.github.io/CoordinateCleaner/articles/Cleaning_GBIF_data_with_CoordinateCleaner.html">CoordinateCleaner
-tutorial</a>. These should be inspected separately if coordinate
-precision matters for the downstream analysis.</p>
+<p>This step removes any record whose reported
+<code>coordinateUncertaintyInMeters</code> exceeds the threshold set in
+the parameters above (<code>coord_uncertainty_km</code> km). Records
+with no reported uncertainty (<code>NA</code>) are retained, following
+the convention in the CoordinateCleaner tutorial; these should be
+inspected separately later on.</p>
 <pre class="r"><code>clean &lt;- clean %&gt;%
   filter(is.na(coordinateUncertaintyInMeters) |
            (coordinateUncertaintyInMeters / 1000) &lt;= coord_uncertainty_km)
-
 log_msg(nrow(clean), &quot; records remaining after precision filter (&lt;= &quot;,
         coord_uncertainty_km, &quot; km)&quot;)</code></pre>
 </div>
 <div id="coordinatecleaner-dataset-level-tests" class="section level1" number="10">
 <h1><span class="header-section-number">10</span> CoordinateCleaner:
 dataset-level tests</h1>
-<p>Unlike the record-level tests above, these two tests evaluate
-patterns across entire <strong>datasets</strong> (identified by
-<code>datasetKey</code>). They flag whole datasets rather than
-individual records, so their diagnostic reports (written to CSV) should
-be reviewed manually before accepting the automatic filtering.</p>
-<div id="degree-minute-conversion-errors-cd_ddmm" class="section level2" number="10.1">
-<h2><span class="header-section-number">10.1</span> Degree-minute
-conversion errors (<code>cd_ddmm</code>)</h2>
-<p><code>cd_ddmm()</code> tests whether a dataset’s coordinate
-distribution is consistent with a systematic “dd.mm → dd.dd” conversion
-error — a common data-entry mistake where degree-minute values are
-incorrectly recorded as decimal degrees (e.g., 45°30′ entered as 45.30°
-instead of 45.50°).</p>
-</div>
-<div id="rasterized-sampling-cd_round" class="section level2" number="10.2">
-<h2><span class="header-section-number">10.2</span> Rasterized sampling
-(<code>cd_round</code>)</h2>
-<p><code>cd_round()</code> tests whether a dataset’s coordinates show an
-unusually regular lattice pattern, which can indicate that points were
-assigned to grid-cell centroids rather than actual sampling
+<p>These tests evaluate coordinate patterns across entire GBIF datasets
+(identified by <code>datasetKey</code>), flagging whole datasets rather
+than individual records.</p>
+<p><strong><code>cd_ddmm()</code></strong> tests whether a dataset’s
+coordinate distribution is consistent with a systematic “dd.mm → dd.dd”
+conversion error — a common data-entry mistake where degree-minute
+values are incorrectly recorded as decimal degrees.</p>
+<p><strong><code>cd_round()</code></strong> tests whether a dataset’s
+coordinates show an unusually regular lattice pattern, indicating that
+points were assigned to grid-cell centroids rather than actual sampling
 locations.</p>
-<p>Both tests are parallelized by splitting datasets across workers
-(never splitting a single dataset’s records, which would break the
-within-dataset statistics). All four calls (<code>cd_ddmm</code>
-diagnostic/flagged, <code>cd_round</code> diagnostic/flagged) are
-wrapped in <code>tryCatch</code> because <code>cd_ddmm()</code> can fail
-on datasets with very few records (its internal
-<code>binom.test()</code> receives invalid inputs). When a chunk fails,
-its records are conservatively kept (flagged as <code>TRUE</code>).</p>
-<p>This step is <strong>checkpointed</strong>: if
-<code>dataset_level_flags.rds</code> already exists, the saved flags are
-loaded.</p>
+<p>Diagnostic reports are written to
+<code>ddmm_conversion_flags_by_dataset.csv</code> and
+<code>rasterized_sampling_flags_by_dataset.csv</code> for manual review.
+This step is <strong>checkpointed</strong> to
+<code>dataset_level_flags.rds</code>.</p>
 <pre class="r"><code>dataset_rds &lt;- file.path(out_dir, &quot;dataset_level_flags.rds&quot;)
-
 if (file.exists(dataset_rds) &amp;&amp; !FORCE_RERUN) {
-
   log_msg(&quot;Found existing dataset-level flags at &quot;, dataset_rds, &quot; -- loading from disk&quot;)
   saved &lt;- readRDS(dataset_rds)
   ddmm_report  &lt;- saved$ddmm_report
   round_report &lt;- saved$round_report
   ddmm_flags   &lt;- saved$ddmm_flags
   round_flags  &lt;- saved$round_flags
-
 } else {
-
   log_msg(&quot;Running cd_ddmm() and cd_round() across &quot;, length(unique(clean$datasetKey)),
           &quot; datasets (&quot;, N_WORKERS, &quot; workers)...&quot;)
-
   dataset_ids &lt;- unique(clean$datasetKey)
   dataset_chunks &lt;- split(dataset_ids,
                           cut(seq_along(dataset_ids), N_WORKERS, labels = FALSE))
-
+  
   chunk_results &lt;- future_map(dataset_chunks, function(ds_chunk) {
     sub &lt;- clean[clean$datasetKey %in% ds_chunk, ]
-
+    
+    # tryCatch: cd_ddmm() can fail on datasets with very few records (binom.test
+    # receives invalid n &lt; x). Treat such chunks as passing (all TRUE).
     ddmm_ds &lt;- tryCatch({
       res &lt;- cd_ddmm(sub, lon = &quot;decimalLongitude&quot;, lat = &quot;decimalLatitude&quot;,
-                      ds = &quot;datasetKey&quot;, diagnostic = TRUE, diff = 1, value = &quot;dataset&quot;)
+                     ds = &quot;datasetKey&quot;, diagnostic = TRUE, diff = 1, value = &quot;dataset&quot;)
       tibble::rownames_to_column(res, var = &quot;datasetKey&quot;)
     }, error = function(e) {
       message(&quot;  cd_ddmm() failed for a chunk (&quot;, length(ds_chunk), &quot; datasets): &quot;, conditionMessage(e))
@@ -2158,7 +2130,7 @@ if (file.exists(dataset_rds) &amp;&amp; !FORCE_RERUN) {
       cd_ddmm(sub, lon = &quot;decimalLongitude&quot;, lat = &quot;decimalLatitude&quot;,
               ds = &quot;datasetKey&quot;, diff = 1, value = &quot;flagged&quot;)
     }, error = function(e) rep(TRUE, nrow(sub)))
-
+    
     round_ds &lt;- tryCatch({
       cd_round(sub, lon = &quot;decimalLongitude&quot;, lat = &quot;decimalLatitude&quot;,
                ds = &quot;datasetKey&quot;, T1 = 7, value = &quot;dataset&quot;, graphs = FALSE)
@@ -2170,69 +2142,67 @@ if (file.exists(dataset_rds) &amp;&amp; !FORCE_RERUN) {
       cd_round(sub, lon = &quot;decimalLongitude&quot;, lat = &quot;decimalLatitude&quot;,
                ds = &quot;datasetKey&quot;, T1 = 7, value = &quot;flagged&quot;, graphs = FALSE)
     }, error = function(e) rep(TRUE, nrow(sub)))
-
+    
     list(
       ddmm_report  = ddmm_ds,
       round_report = round_ds,
       flags        = tibble(row_id = sub$row_id, ddmm_flag = ddmm_fl, round_flag = round_fl)
     )
   }, .progress = FALSE)
-
+  
   ddmm_report  &lt;- bind_rows(map(chunk_results, &quot;ddmm_report&quot;))
   round_report &lt;- bind_rows(map(chunk_results, &quot;round_report&quot;))
   flags_all    &lt;- bind_rows(map(chunk_results, &quot;flags&quot;)) %&gt;% arrange(row_id)
   ddmm_flags   &lt;- flags_all$ddmm_flag
   round_flags  &lt;- flags_all$round_flag
-
+  
   write_csv(ddmm_report, file.path(out_dir, &quot;ddmm_conversion_flags_by_dataset.csv&quot;))
   write_csv(round_report, file.path(out_dir, &quot;rasterized_sampling_flags_by_dataset.csv&quot;))
-
+  
   saveRDS(list(ddmm_report = ddmm_report, round_report = round_report,
                ddmm_flags = ddmm_flags, round_flags = round_flags),
           dataset_rds)
 }
 
+# Remove records belonging to datasets flagged by either test.
+# NOTE: these are dataset-level tests, so review ddmm_conversion_flags_by_dataset.csv
+# and rasterized_sampling_flags_by_dataset.csv before treating this as final -
+# a flagged dataset may still contain a mix of good and bad records.
 clean_final &lt;- clean[ddmm_flags &amp; round_flags, ]
-
 log_msg(nrow(clean) - nrow(clean_final),
         &quot; records removed for belonging to a flagged dataset (ddmm/rasterized tests)&quot;)
 log_msg(nrow(clean_final), &quot; final cleaned records&quot;)</code></pre>
 </div>
-</div>
 <div id="save-outputs" class="section level1" number="11">
 <h1><span class="header-section-number">11</span> Save outputs</h1>
 <p>Cleaned records are written to one CSV per species in
-<code>gbif_clean_output/species_csvs/</code>. Column names
-<code>decimalLongitude</code> and <code>decimalLatitude</code> are
-lowercased to <code>decimallongitude</code> and
-<code>decimallatitude</code> for compatibility with downstream
-tools.</p>
-<p>For species where GBIF’s accepted name differs from the input name
-(synonym cases identified <a href="#backbone">above</a>), the output
-filename includes both names:
+<code>gbif_clean_output/species_csvs/</code>. Coordinate column names
+are lowercased to <code>decimallongitude</code> and
+<code>decimallatitude</code> for compatibility with Genes from Space.
+For synonym cases where GBIF’s accepted name differs from the input
+name, the output filename includes both:
 <code>InputName_AcceptedName_Nn_YYYY-MM-DD.csv</code>.</p>
-<pre class="r"><code>clean_final &lt;- clean_final %&gt;%
+<pre class="r"><code># Rename column names, into a format more useful for GFS
+clean_final &lt;- clean_final %&gt;%
   select(-row_id) %&gt;%
   rename(decimallongitude = decimalLongitude, decimallatitude = decimalLatitude)
-
 species_dir &lt;- file.path(out_dir, &quot;species_csvs&quot;)
 dir.create(species_dir, showWarnings = FALSE)
 
 for (sp in unique(clean_final$species)) {
   sp_data &lt;- clean_final[clean_final$species == sp, ]
-
+  
+  # If GBIF&#39;s accepted name differs from the input name, prepend the input name
   input_match &lt;- name_lookup$input_name[name_lookup$gbif_name == sp]
   if (length(input_match) == 1 &amp;&amp; input_match != sp) {
     file_prefix &lt;- paste0(gsub(&quot; &quot;, &quot;_&quot;, input_match), &quot;_&quot;, gsub(&quot; &quot;, &quot;_&quot;, sp))
   } else {
     file_prefix &lt;- gsub(&quot; &quot;, &quot;_&quot;, sp)
   }
-
   sp_file &lt;- file.path(species_dir, paste0(file_prefix, &quot;_&quot;, nrow(sp_data), &quot;n_&quot;,
                                            format(Sys.Date(), &quot;%Y-%m-%d&quot;), &quot;.csv&quot;))
   write_csv(sp_data, sp_file)
 }
-
 elapsed &lt;- round(difftime(Sys.time(), script_start, units = &quot;mins&quot;), 1)
 log_msg(&quot;=== Done in &quot;, elapsed, &quot; minutes. Cleaned data written to: &quot;,
         species_dir, &quot; (one CSV per species) ===&quot;)</code></pre>
@@ -2240,14 +2210,14 @@ log_msg(&quot;=== Done in &quot;, elapsed, &quot; minutes. Cleaned data written 
 <div id="reconciliation-missing-species" class="section level1" number="12">
 <h1><span class="header-section-number">12</span> Reconciliation:
 missing species</h1>
-<p>Not every input species will necessarily have records in the final
-output. This section identifies which species are missing and diagnoses
-why, by checking whether they were present at each stage of the
-pipeline.</p>
-<p>Species whose input name was a synonym (and whose records appear
-under GBIF’s accepted name) are excluded from the “missing” count — they
-do have output, just under a different filename.</p>
-<pre class="r"><code>synonym_inputs &lt;- name_lookup$input_name[name_lookup$gbif_name %in% unique(clean_final$species)]
+<p>Not every input species will have records in the final output. This
+section identifies which species are missing and diagnoses why by
+checking whether they were present at each pipeline stage. Species whose
+input name was a synonym (with records present under the GBIF accepted
+name) are excluded from the “missing” count.</p>
+<pre class="r"><code># Reconcile: which input species have no records in the final output, and why?
+# Exclude synonym species that DO have output under their accepted name
+synonym_inputs &lt;- name_lookup$input_name[name_lookup$gbif_name %in% unique(clean_final$species)]
 missing_spp &lt;- setdiff(species_list, c(unique(clean_final$species), synonym_inputs))
 if (length(missing_spp) &gt; 0) {
   log_msg(length(missing_spp), &quot; species from the input list have no final output:&quot;)
