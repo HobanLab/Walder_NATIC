@@ -36,11 +36,10 @@ pacman::p_load(rgbif, taxize, CoordinateCleaner, dplyr, countrycode,
                readr, purrr, tibble, future, furrr)
 
 # %%% 1. Parameters ---------------------------------------------------------------
-setwd('/home/akoontz/Documents/Indicators/Walder_Indicators/Scripts/GBIF_occurrences/')
+setwd('/home/akoontz/Documents/Indicators/Walder_Indicators/Code/gbifOccurrences/')
 species_file <- "speciesLists/SpeciesList_2026-08-20_40n_MexicanSpecies.csv"   # one species name per row, no header
 out_dir      <- "gbif_clean_output"
 dir.create(out_dir, showWarnings = FALSE)
-
 year_range <- c(1975, 2025)
 
 # North America: US, Canada, Mexico + Caribbean (ISO 3166-1 alpha-2 codes)
@@ -100,10 +99,9 @@ log_msg(nrow(accepted), " of ", length(species_list),
         " species matched to a GBIF backbone accepted usage")
 
 # %%% 4. Enumerate synonyms for documentation ------------------------------------
-# Primary source: GBIF's own backbone. Optionally cross-checked against Kew's 
-# Plants of the World Online via taxize, which is wrapped in tryCatch 
-# since that external API is known to rate-limit/block programmatic access 
-# (HTTP 403/429/502). Parallelized.
+# Primary source: GBIF's own backbone. Optionally cross-checked against Kew's
+# Plants of the World Online via taxize, which is wrapped in tryCatch
+# since that external API is known to block programmatic access
 get_gbif_synonyms <- function(key) {
   tryCatch({
     syn <- name_usage(key = key, data = "synonyms")$data
@@ -143,7 +141,7 @@ log_msg(length(gbif_keys), " unique GBIF accepted taxon keys will be queried ",
         "(synonym occurrences are included automatically by GBIF's taxonKey filter)")
 
 # %%% 5. Submit GBIF occurrence download ---------------------------------------
-# occ_download() runs server-side on GBIF, so a single request handles all 
+# occ_download() runs server-side on GBIF, so a single request handles all
 # species at once. If a previous run already completed the download, skip
 # straight to loading the saved raw data (Step 6).
 raw_rds <- file.path(out_dir, "GBIF_occurrences_raw.rds")
@@ -163,24 +161,19 @@ if (file.exists(raw_rds) && !FORCE_RERUN) {
     pred("hasCoordinate", TRUE),
     pred("hasGeospatialIssue", FALSE),
     pred_not(pred_in("basisOfRecord", c("FOSSIL_SPECIMEN", "LIVING_SPECIMEN"))),  # exclude fossils and ex situ (zoo/garden) specimens
-    format = "SIMPLE_CSV"
+    format = "DWCA"
   )
-  
   log_msg("Download submitted: ", download_key,
           " -- waiting for GBIF to prepare it (status printed every 60s)...")
   
   # status_ping controls how often occ_download_wait() polls and prints status,
-  # so background progress is visible in run_log.txt while you're away.
+  # so background progress is visible in run_log.txt
   occ_download_wait(download_key, status_ping = 60, quiet = FALSE)
-  
   dl_path <- occ_download_get(download_key, path = out_dir, overwrite = TRUE)
   dat_raw <- occ_download_import(dl_path)
-  
   log_msg(nrow(dat_raw), " raw occurrence records downloaded")
-  
   saveRDS(dat_raw, raw_rds)
-  
-  # Save the citation - cite this in any resulting publication
+  # Save the citation 
   writeLines(format(gbif_citation(dl_path)), file.path(out_dir, "gbif_citation.txt"))
 }
 
@@ -194,7 +187,7 @@ missing_input <- setdiff(species_list, gbif_species)   # input names not in down
 
 # Match each extra (accepted) name back to the input (synonym) name via the
 # backbone's usageKey: both the input synonym and the accepted name share the
-# same accepted usageKey, so we can join on that.
+# same accepted usageKey
 name_lookup <- tibble(input_name = character(), gbif_name = character())
 if (length(extra_species) > 0 && length(missing_input) > 0) {
   # For each extra species, look up its usageKey, then find which input name
@@ -223,8 +216,43 @@ dat <- dat_raw %>%
   select(species, decimalLongitude, decimalLatitude, countryCode,
          individualCount, gbifID, family, taxonRank,
          coordinateUncertaintyInMeters, year, basisOfRecord,
-         institutionCode, datasetKey) %>%
+         institutionCode, datasetKey,
+         dataGeneralizations, informationWithheld) %>%
   filter(!is.na(decimalLongitude), !is.na(decimalLatitude))
+
+# %%% 6b. Filter records with obscured/generalized coordinates for geoprivacy ---
+# Matches common phrases data providers use when coordinates have been
+# randomized, generalized, or obscured for sensitive-species protection.
+geoprivacy_pattern <- paste(
+  "coordinate.*obscur", "coordinate.*generaliz", "coordinate.*randomiz",
+  "coordinate.*round", "coordinate.*truncat", "coordinate.*alter",
+  "location.*obscur", "location.*generaliz", "location.*randomiz",
+  "location.*withheld", "geoprivacy", "sensitive.*species",
+  sep = "|"
+)
+
+dat$geoprivacy_flag <- grepl(geoprivacy_pattern, dat$dataGeneralizations, ignore.case = TRUE) |
+  grepl(geoprivacy_pattern, dat$informationWithheld, ignore.case = TRUE)
+
+geoprivacy_tally <- dat %>%
+  group_by(species) %>%
+  summarise(
+    total_records     = n(),
+    geoprivacy_removed = sum(geoprivacy_flag),
+    .groups = "drop"
+  ) %>%
+  filter(geoprivacy_removed > 0)
+
+if (nrow(geoprivacy_tally) > 0) {
+  log_msg(sum(dat$geoprivacy_flag), " records flagged for geoprivacy coordinate obscuring across ",
+          nrow(geoprivacy_tally), " species")
+  write_csv(geoprivacy_tally, file.path(out_dir, "geoprivacy_removed_by_species.csv"))
+} else {
+  log_msg("No records flagged for geoprivacy coordinate obscuring")
+}
+dat <- dat %>%
+  filter(!geoprivacy_flag) %>%
+  select(-dataGeneralizations, -informationWithheld, -geoprivacy_flag)
 
 # ISO2 -> ISO3, required by cc_coun()
 dat$countryCode <- countrycode(dat$countryCode, origin = "iso2c", destination = "iso3c")
@@ -258,15 +286,12 @@ log_msg(nrow(dat) - nrow(clean), " records removed by record-level tests; ", nro
 outl_rds <- file.path(out_dir, "cc_outl_flags.rds")
 
 if (file.exists(outl_rds) && !FORCE_RERUN) {
-  
   log_msg("Found existing cc_outl() flags at ", outl_rds, " -- loading from disk")
   outl_flags <- readRDS(outl_rds)
-  
 } else {
-  
   log_msg("Running cc_outl() across ", length(unique(clean$species)),
           " species (", N_WORKERS, " workers)...")
-  
+
   species_chunks <- split(unique(clean$species),
                           cut(seq_along(unique(clean$species)), N_WORKERS, labels = FALSE))
   
@@ -275,16 +300,13 @@ if (file.exists(outl_rds) && !FORCE_RERUN) {
     flags <- cc_outl(sub, species = "species", value = "flagged", verbose = FALSE)
     tibble(row_id = sub$row_id, outl_flag = flags)
   }, .progress = FALSE)
-  
   outl_flags <- bind_rows(outl_results) %>% arrange(row_id)
   saveRDS(outl_flags, outl_rds)
 }
-
 clean <- clean %>%
   left_join(outl_flags, by = "row_id") %>%
   filter(outl_flag) %>%
   select(-outl_flag)
-
 log_msg(nrow(clean), " records remaining after cc_outl()")
 
 # %%% 8. Coordinate precision filter --------------------------------------------
@@ -293,7 +315,6 @@ log_msg(nrow(clean), " records remaining after cc_outl()")
 clean <- clean %>%
   filter(is.na(coordinateUncertaintyInMeters) |
            (coordinateUncertaintyInMeters / 1000) <= coord_uncertainty_km)
-
 log_msg(nrow(clean), " records remaining after precision filter (<= ",
         coord_uncertainty_km, " km)")
 
@@ -301,21 +322,16 @@ log_msg(nrow(clean), " records remaining after precision filter (<= ",
 # cd_ddmm() and cd_round() group by datasetKey, so chunks are built by
 # splitting whole datasets across workers.
 dataset_rds <- file.path(out_dir, "dataset_level_flags.rds")
-
 if (file.exists(dataset_rds) && !FORCE_RERUN) {
-  
   log_msg("Found existing dataset-level flags at ", dataset_rds, " -- loading from disk")
   saved <- readRDS(dataset_rds)
   ddmm_report  <- saved$ddmm_report
   round_report <- saved$round_report
   ddmm_flags   <- saved$ddmm_flags
   round_flags  <- saved$round_flags
-  
 } else {
-  
   log_msg("Running cd_ddmm() and cd_round() across ", length(unique(clean$datasetKey)),
           " datasets (", N_WORKERS, " workers)...")
-  
   dataset_ids <- unique(clean$datasetKey)
   dataset_chunks <- split(dataset_ids,
                           cut(seq_along(dataset_ids), N_WORKERS, labels = FALSE))
@@ -376,7 +392,6 @@ if (file.exists(dataset_rds) && !FORCE_RERUN) {
 # and rasterized_sampling_flags_by_dataset.csv before treating this as final -
 # a flagged dataset may still contain a mix of good and bad records.
 clean_final <- clean[ddmm_flags & round_flags, ]
-
 log_msg(nrow(clean) - nrow(clean_final),
         " records removed for belonging to a flagged dataset (ddmm/rasterized tests)")
 log_msg(nrow(clean_final), " final cleaned records")
@@ -386,7 +401,6 @@ log_msg(nrow(clean_final), " final cleaned records")
 clean_final <- clean_final %>%
   select(-row_id) %>%
   rename(decimallongitude = decimalLongitude, decimallatitude = decimalLatitude)
-
 species_dir <- file.path(out_dir, "species_csvs")
 dir.create(species_dir, showWarnings = FALSE)
 
@@ -400,12 +414,10 @@ for (sp in unique(clean_final$species)) {
   } else {
     file_prefix <- gsub(" ", "_", sp)
   }
-  
   sp_file <- file.path(species_dir, paste0(file_prefix, "_", nrow(sp_data), "n_",
                                            format(Sys.Date(), "%Y-%m-%d"), ".csv"))
   write_csv(sp_data, sp_file)
 }
-
 elapsed <- round(difftime(Sys.time(), script_start, units = "mins"), 1)
 log_msg("=== Done in ", elapsed, " minutes. Cleaned data written to: ",
         species_dir, " (one CSV per species) ===")
