@@ -37,7 +37,7 @@ pacman::p_load(rgbif, taxize, CoordinateCleaner, dplyr, countrycode,
 
 # %%% 1. Parameters ---------------------------------------------------------------
 setwd('/home/akoontz/Documents/Indicators/Walder_Indicators/Code/gbifOccurrences/')
-species_file <- "speciesLists/SpeciesList_2026-08-20_40n_MexicanSpecies.csv"   # one species name per row, no header
+species_file <- "speciesLists/SpeciesList_2026-09-10_4n.csv"   # one species name per row, no header
 out_dir      <- "gbif_clean_output"
 dir.create(out_dir, showWarnings = FALSE)
 year_range <- c(1975, 2025)
@@ -94,6 +94,34 @@ if (nrow(unmatched) > 0) {
 }
 
 accepted <- backbone %>% filter(matchType %in% c("EXACT", "FUZZY"))
+
+# Detect input names that are synonyms in GBIF's backbone. For these, the
+# download will return records labeled with the accepted species name, not the
+# input name. We detect them via the 'synonym' column returned by
+# name_backbone_checklist(), and look up the accepted species name via
+# name_usage() so we can map input name -> GBIF accepted name.
+synonym_rows <- accepted %>% filter(synonym == TRUE)
+name_lookup <- tibble(input_name = character(), gbif_name = character())
+if (nrow(synonym_rows) > 0) {
+  name_lookup <- map_dfr(seq_len(nrow(synonym_rows)), function(i) {
+    row <- synonym_rows[i, ]
+    accepted_info <- tryCatch({
+      name_usage(key = row$usageKey)$data
+    }, error = function(e) NULL)
+    if (!is.null(accepted_info) && "species" %in% names(accepted_info)) {
+      tibble(input_name = row$verbatim_name, gbif_name = accepted_info$species)
+    } else {
+      tibble(input_name = character(), gbif_name = character())
+    }
+  }) %>% filter(input_name != gbif_name) %>% distinct()
+}
+
+if (nrow(name_lookup) > 0) {
+  log_msg(nrow(name_lookup), " input names are synonyms in GBIF's backbone:")
+  for (i in seq_len(nrow(name_lookup))) {
+    log_msg("  ", name_lookup$input_name[i], " -> ", name_lookup$gbif_name[i])
+  }
+}
 
 log_msg(nrow(accepted), " of ", length(species_list),
         " species matched to a GBIF backbone accepted usage")
@@ -177,40 +205,6 @@ if (file.exists(raw_rds) && !FORCE_RERUN) {
   writeLines(format(gbif_citation(dl_path)), file.path(out_dir, "gbif_citation.txt"))
 }
 
-# Build lookup: input name -> GBIF accepted name, by comparing the input
-# species list against the species names that actually appear in the downloaded
-# data. GBIF's download labels records with its accepted species name, so any
-# input name that doesn't appear verbatim in dat_raw$species was a synonym.
-gbif_species <- unique(dat_raw$species)
-extra_species <- setdiff(gbif_species, species_list)   # names in download but not in input
-missing_input <- setdiff(species_list, gbif_species)   # input names not in download (synonym or no records)
-
-# Match each extra (accepted) name back to the input (synonym) name via the
-# backbone's usageKey: both the input synonym and the accepted name share the
-# same accepted usageKey
-name_lookup <- tibble(input_name = character(), gbif_name = character())
-if (length(extra_species) > 0 && length(missing_input) > 0) {
-  # For each extra species, look up its usageKey, then find which input name
-  # mapped to the same key
-  extra_keys <- map_dfr(extra_species, function(sp) {
-    bb <- name_backbone(name = sp, kingdom = "Plantae")
-    tibble(gbif_name = sp, key = bb$usageKey)
-  })
-  input_keys <- accepted %>%
-    transmute(input_name = verbatim_name, key = usageKey)
-  name_lookup <- inner_join(input_keys, extra_keys, by = "key") %>%
-    filter(input_name != gbif_name) %>%
-    select(input_name, gbif_name) %>%
-    distinct()
-}
-
-if (nrow(name_lookup) > 0) {
-  log_msg(nrow(name_lookup), " input names are synonyms in GBIF's backbone:")
-  for (i in seq_len(nrow(name_lookup))) {
-    log_msg("  ", name_lookup$input_name[i], " -> ", name_lookup$gbif_name[i])
-  }
-}
-
 # %%% 6. Prepare data for cleaning ----------------------------------------------
 dat <- dat_raw %>%
   select(species, decimalLongitude, decimalLatitude, countryCode,
@@ -291,7 +285,7 @@ if (file.exists(outl_rds) && !FORCE_RERUN) {
 } else {
   log_msg("Running cc_outl() across ", length(unique(clean$species)),
           " species (", N_WORKERS, " workers)...")
-
+  
   species_chunks <- split(unique(clean$species),
                           cut(seq_along(unique(clean$species)), N_WORKERS, labels = FALSE))
   
