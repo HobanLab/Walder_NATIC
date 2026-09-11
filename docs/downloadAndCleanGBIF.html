@@ -11,7 +11,7 @@
 
 <meta name="author" content="Austin Koontz" />
 
-<meta name="date" content="2026-09-03" />
+<meta name="date" content="2026-09-11" />
 
 <title>GBIF Occurrence Download &amp; CoordinateCleaner QC Pipeline</title>
 
@@ -1588,7 +1588,7 @@ border-radius: 0px;
 <h1 class="title toc-ignore">GBIF Occurrence Download &amp;
 CoordinateCleaner QC Pipeline</h1>
 <h4 class="author">Austin Koontz</h4>
-<h4 class="date">September 03, 2026</h4>
+<h4 class="date">September 11, 2026</h4>
 
 </div>
 
@@ -1696,7 +1696,14 @@ be matched (<code>matchType</code> of <code>&quot;NONE&quot;</code> or
 <code>unmatched_names.csv</code> for manual review.</p>
 <p>GBIF’s <code>taxonKey</code> occurrence filter automatically includes
 records filed under synonyms of a matched accepted name, so no extra
-synonym-handling is needed for the download itself.</p>
+synonym-handling is needed for the download itself. However, when an
+input name is itself a synonym in GBIF’s backbone (indicated by
+<code>synonym == TRUE</code> in the backbone result), the downloaded
+records will be labeled with the <strong>accepted</strong> species name,
+not the input name. This step detects such cases and builds a
+<code>name_lookup</code> table mapping each input synonym to the
+accepted name GBIF will use, via <code>name_usage()</code>. This lookup
+is used later to label output filenames with both names.</p>
 <pre class="r"><code>log_msg(&quot;Matching &quot;, length(species_list), &quot; names to GBIF backbone...&quot;)
 
 backbone &lt;- name_backbone_checklist(species_list)
@@ -1709,6 +1716,34 @@ if (nrow(unmatched) &gt; 0) {
 }
 
 accepted &lt;- backbone %&gt;% filter(matchType %in% c(&quot;EXACT&quot;, &quot;FUZZY&quot;))
+
+# Detect input names that are synonyms in GBIF&#39;s backbone. For these, the
+# download will return records labeled with the accepted species name, not the
+# input name. We detect them via the &#39;synonym&#39; column returned by
+# name_backbone_checklist(), and look up the accepted species name via
+# name_usage() so we can map input name -&gt; GBIF accepted name.
+synonym_rows &lt;- accepted %&gt;% filter(synonym == TRUE)
+name_lookup &lt;- tibble(input_name = character(), gbif_name = character())
+if (nrow(synonym_rows) &gt; 0) {
+  name_lookup &lt;- map_dfr(seq_len(nrow(synonym_rows)), function(i) {
+    row &lt;- synonym_rows[i, ]
+    accepted_info &lt;- tryCatch({
+      name_usage(key = row$usageKey)$data
+    }, error = function(e) NULL)
+    if (!is.null(accepted_info) &amp;&amp; &quot;species&quot; %in% names(accepted_info)) {
+      tibble(input_name = row$verbatim_name, gbif_name = accepted_info$species)
+    } else {
+      tibble(input_name = character(), gbif_name = character())
+    }
+  }) %&gt;% filter(input_name != gbif_name) %&gt;% distinct()
+}
+
+if (nrow(name_lookup) &gt; 0) {
+  log_msg(nrow(name_lookup), &quot; input names are synonyms in GBIF&#39;s backbone:&quot;)
+  for (i in seq_len(nrow(name_lookup))) {
+    log_msg(&quot;  &quot;, name_lookup$input_name[i], &quot; -&gt; &quot;, name_lookup$gbif_name[i])
+  }
+}
 
 log_msg(nrow(accepted), &quot; of &quot;, length(species_list),
         &quot; species matched to a GBIF backbone accepted usage&quot;)</code></pre>
@@ -1848,51 +1883,6 @@ if (file.exists(raw_rds) &amp;&amp; !FORCE_RERUN) {
   # Save the citation 
   writeLines(format(gbif_citation(dl_path)), file.path(out_dir, &quot;gbif_citation.txt&quot;))
 }</code></pre>
-<div id="identify-synonym-renames" class="section level2" number="6.1">
-<h2><span class="header-section-number">6.1</span> Identify synonym
-renames</h2>
-<p>GBIF labels every downloaded record with its
-<strong>accepted</strong> species name, not the queried name. If an
-input name is a synonym in GBIF’s backbone, its records appear under a
-different name in the <code>species</code> column. This step detects
-those cases and traces each “extra” accepted name back to the input
-synonym via shared <code>usageKey</code> values. The resulting
-<code>name_lookup</code> table is used later to label output filenames
-with both names.</p>
-<pre class="r"><code># Build lookup: input name -&gt; GBIF accepted name, by comparing the input
-# species list against the species names that actually appear in the downloaded
-# data. GBIF&#39;s download labels records with its accepted species name, so any
-# input name that doesn&#39;t appear verbatim in dat_raw$species was a synonym.
-gbif_species &lt;- unique(dat_raw$species)
-extra_species &lt;- setdiff(gbif_species, species_list)   # names in download but not in input
-missing_input &lt;- setdiff(species_list, gbif_species)   # input names not in download (synonym or no records)
-
-# Match each extra (accepted) name back to the input (synonym) name via the
-# backbone&#39;s usageKey: both the input synonym and the accepted name share the
-# same accepted usageKey
-name_lookup &lt;- tibble(input_name = character(), gbif_name = character())
-if (length(extra_species) &gt; 0 &amp;&amp; length(missing_input) &gt; 0) {
-  # For each extra species, look up its usageKey, then find which input name
-  # mapped to the same key
-  extra_keys &lt;- map_dfr(extra_species, function(sp) {
-    bb &lt;- name_backbone(name = sp, kingdom = &quot;Plantae&quot;)
-    tibble(gbif_name = sp, key = bb$usageKey)
-  })
-  input_keys &lt;- accepted %&gt;%
-    transmute(input_name = verbatim_name, key = usageKey)
-  name_lookup &lt;- inner_join(input_keys, extra_keys, by = &quot;key&quot;) %&gt;%
-    filter(input_name != gbif_name) %&gt;%
-    select(input_name, gbif_name) %&gt;%
-    distinct()
-}
-
-if (nrow(name_lookup) &gt; 0) {
-  log_msg(nrow(name_lookup), &quot; input names are synonyms in GBIF&#39;s backbone:&quot;)
-  for (i in seq_len(nrow(name_lookup))) {
-    log_msg(&quot;  &quot;, name_lookup$input_name[i], &quot; -&gt; &quot;, name_lookup$gbif_name[i])
-  }
-}</code></pre>
-</div>
 </div>
 <div id="prepare-data-for-cleaning" class="section level1" number="7">
 <h1><span class="header-section-number">7</span> Prepare data for
