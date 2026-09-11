@@ -128,7 +128,13 @@ each name. Names that cannot be matched (`matchType` of `"NONE"` or
 
 GBIF's `taxonKey` occurrence filter automatically includes records filed
 under synonyms of a matched accepted name, so no extra synonym-handling
-is needed for the download itself.
+is needed for the download itself. However, when an input name is itself
+a synonym in GBIF's backbone (indicated by `synonym == TRUE` in the
+backbone result), the downloaded records will be labeled with the
+**accepted** species name, not the input name. This step detects such
+cases and builds a `name_lookup` table mapping each input synonym to the
+accepted name GBIF will use, via `name_usage()`. This lookup is used
+later to label output filenames with both names.
 
 ```{r backbone-match}
 log_msg("Matching ", length(species_list), " names to GBIF backbone...")
@@ -143,6 +149,34 @@ if (nrow(unmatched) > 0) {
 }
 
 accepted <- backbone %>% filter(matchType %in% c("EXACT", "FUZZY"))
+
+# Detect input names that are synonyms in GBIF's backbone. For these, the
+# download will return records labeled with the accepted species name, not the
+# input name. We detect them via the 'synonym' column returned by
+# name_backbone_checklist(), and look up the accepted species name via
+# name_usage() so we can map input name -> GBIF accepted name.
+synonym_rows <- accepted %>% filter(synonym == TRUE)
+name_lookup <- tibble(input_name = character(), gbif_name = character())
+if (nrow(synonym_rows) > 0) {
+  name_lookup <- map_dfr(seq_len(nrow(synonym_rows)), function(i) {
+    row <- synonym_rows[i, ]
+    accepted_info <- tryCatch({
+      name_usage(key = row$usageKey)$data
+    }, error = function(e) NULL)
+    if (!is.null(accepted_info) && "species" %in% names(accepted_info)) {
+      tibble(input_name = row$verbatim_name, gbif_name = accepted_info$species)
+    } else {
+      tibble(input_name = character(), gbif_name = character())
+    }
+  }) %>% filter(input_name != gbif_name) %>% distinct()
+}
+
+if (nrow(name_lookup) > 0) {
+  log_msg(nrow(name_lookup), " input names are synonyms in GBIF's backbone:")
+  for (i in seq_len(nrow(name_lookup))) {
+    log_msg("  ", name_lookup$input_name[i], " -> ", name_lookup$gbif_name[i])
+  }
+}
 
 log_msg(nrow(accepted), " of ", length(species_list),
         " species matched to a GBIF backbone accepted usage")
@@ -253,52 +287,6 @@ if (file.exists(raw_rds) && !FORCE_RERUN) {
   saveRDS(dat_raw, raw_rds)
   # Save the citation 
   writeLines(format(gbif_citation(dl_path)), file.path(out_dir, "gbif_citation.txt"))
-}
-```
-
-## Identify synonym renames
-
-GBIF labels every downloaded record with its **accepted** species name,
-not the queried name. If an input name is a synonym in GBIF's backbone,
-its records appear under a different name in the `species` column. This
-step detects those cases and traces each "extra" accepted name back to
-the input synonym via shared `usageKey` values. The resulting
-`name_lookup` table is used later to label output filenames with both
-names.
-
-```{r synonym-lookup}
-# Build lookup: input name -> GBIF accepted name, by comparing the input
-# species list against the species names that actually appear in the downloaded
-# data. GBIF's download labels records with its accepted species name, so any
-# input name that doesn't appear verbatim in dat_raw$species was a synonym.
-gbif_species <- unique(dat_raw$species)
-extra_species <- setdiff(gbif_species, species_list)   # names in download but not in input
-missing_input <- setdiff(species_list, gbif_species)   # input names not in download (synonym or no records)
-
-# Match each extra (accepted) name back to the input (synonym) name via the
-# backbone's usageKey: both the input synonym and the accepted name share the
-# same accepted usageKey
-name_lookup <- tibble(input_name = character(), gbif_name = character())
-if (length(extra_species) > 0 && length(missing_input) > 0) {
-  # For each extra species, look up its usageKey, then find which input name
-  # mapped to the same key
-  extra_keys <- map_dfr(extra_species, function(sp) {
-    bb <- name_backbone(name = sp, kingdom = "Plantae")
-    tibble(gbif_name = sp, key = bb$usageKey)
-  })
-  input_keys <- accepted %>%
-    transmute(input_name = verbatim_name, key = usageKey)
-  name_lookup <- inner_join(input_keys, extra_keys, by = "key") %>%
-    filter(input_name != gbif_name) %>%
-    select(input_name, gbif_name) %>%
-    distinct()
-}
-
-if (nrow(name_lookup) > 0) {
-  log_msg(nrow(name_lookup), " input names are synonyms in GBIF's backbone:")
-  for (i in seq_len(nrow(name_lookup))) {
-    log_msg("  ", name_lookup$input_name[i], " -> ", name_lookup$gbif_name[i])
-  }
 }
 ```
 
