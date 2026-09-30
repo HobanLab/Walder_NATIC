@@ -30,7 +30,7 @@ pts_sf <- st_as_sf(pts, coords = c("decimallongitude", "decimallatitude"), crs =
 # OUTLIER SETTINGS AND HELPER FUNCTIONS ----
 # Tukey fence: values beyond Q1 - multiplier*IQR or Q3 + multiplier*IQR are outliers
 # larger multipliers = stricter fence = fewer records flagged
-spatialFenceMultiplier <- 3.5
+spatialFenceMultiplier <- 1.5
 temporalFenceMultiplier <- 1.5
 # Categorical values making up less than this proportion of records are outliers
 rareProp <- 0.01
@@ -106,10 +106,10 @@ colSums(st_drop_geometry(pts_sf)[, c(flagCols, "flag_any")])  # number of record
 flagLayer <- function(col, name, color){
   sub <- pts_sf[pts_sf[[col]], ]
   if(nrow(sub) == 0) return(NULL)
-  mapview(sub, layer.name = name, col.regions = color, color = color, alpha.regions = 0.8, cex = 6)
+  mapview(sub, layer.name = paste0(name, " (n=", nrow(sub), ")"), col.regions = color, color = color, alpha.regions = 0.8, cex = 6)
 }
 # Create basemap, then add layers
-baseMap <- mapview(pts_sf, layer.name = "All occurrences", col.regions = "grey70", color = "grey30",
+baseMap <- mapview(pts_sf, layer.name = paste0("All occurrences (n=", nrow(pts_sf), ")"), col.regions = "grey70", color = "grey30",
                    alpha.regions = 0.5, cex = 4, map.types = c("Esri.WorldImagery", "Esri.WorldTopoMap"))
 layers <- list(
   if(nrow(urban) > 0) mapview(urban, layer.name = "Urban areas", col.regions = "yellow", alpha.regions = 0.2),
