@@ -22,6 +22,9 @@ csvFile <-
   '/home/akoontz/Documents/Indicators/Walder_Indicators/Scripts/GBIF_occurrences/2026-08-19_NATIClist/species_csvs/Austin/Torreya_californica_1783n_2026-08-19.csv'
 pts <- read.csv(file=csvFile, header=TRUE)  
 names(pts)  # Check names of columns with the lat/long
+# Build GBIF record URL for each occurrence 
+gbifURL <- paste0("https://www.gbif.org/occurrence/", format(pts$gbifID, scientific = FALSE, trim = TRUE))
+pts$website <- paste0('<a href="', gbifURL, '" target="_blank">', gbifURL, '</a>')
 
 # CONVERT TO SF OBJECT ----
 # Need to specify a coordinate reference system (crs; WGS84 = 4326; NAD83 = 4269)
