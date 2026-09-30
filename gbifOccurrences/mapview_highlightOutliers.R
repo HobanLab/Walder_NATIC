@@ -32,7 +32,7 @@ pts_sf <- st_as_sf(pts, coords = c("decimallongitude", "decimallatitude"), crs =
 # larger multipliers = stricter fence = fewer records flagged
 spatialFenceMultiplier <- 3.5
 temporalFenceMultiplier <- 1.5
-# categorical values making up less than this proportion of records are outliers
+# Categorical values making up less than this proportion of records are outliers
 rareProp <- 0.01
 
 # Function for flagging continuous variables (spatial/temporal outliers)
@@ -62,6 +62,7 @@ locKey <- paste(coords[,1], coords[,2])
 uniqLoc <- pts_sf[!duplicated(locKey), ]
 distMat <- units::drop_units(st_distance(uniqLoc))
 diag(distMat) <- Inf
+# Calculate nearest neighbor values
 nnDist <- apply(distMat, 1, min) / 1000
 pts_sf$nnDist_km <- nnDist[match(locKey, locKey[!duplicated(locKey)])]
 rm(distMat)
