@@ -78,7 +78,7 @@ log_msg(length(species_list), " species read from ", species_file)
 # GBIF's own `taxonKey` occurrence filter already includes synonym-filed records 
 # automatically -- per GBIF's API documentation, "All included and synonym taxa 
 # are included in the search" for a taxonKey query. So once a species is matched 
-# to its accepted GBIF backbone usageKey, the occ_download() below will already 
+# to its accepted GBIF backbone usageKey, the occ_download() below should already 
 # capture records filed under older/alternate names without any extra step. 
 # Synonyms are still enumerated explicitly below (via GBIF's own backbone, 
 # not an external service) purely to have a documented record of what was folded in.
