@@ -33,11 +33,11 @@
 #   GBIF_EMAIL=your_email@example.com
 # ==============================================================================
 pacman::p_load(rgbif, taxize, CoordinateCleaner, dplyr, countrycode, 
-               readr, purrr, tibble, future, furrr)
+               readr, purrr, tibble, future, furrr, tidyr, rnaturalearth)
 
 # %%% 1. Parameters ---------------------------------------------------------------
 setwd('/home/akoontz/Documents/Indicators/Walder_Indicators/Code/gbifOccurrences/')
-species_file <- "speciesLists/SpeciesList_2026-09-10_4n.csv"   # one species name per row, no header
+species_file <- "speciesLists/SpeciesList_2026-10-07_3n.csv"   # one species name per row, no header
 out_dir      <- "gbif_clean_output"
 dir.create(out_dir, showWarnings = FALSE)
 year_range <- c(1975, 2025)
@@ -83,16 +83,13 @@ log_msg(length(species_list), " species read from ", species_file)
 # Synonyms are still enumerated explicitly below (via GBIF's own backbone, 
 # not an external service) purely to have a documented record of what was folded in.
 log_msg("Matching ", length(species_list), " names to GBIF backbone...")
-
 backbone <- name_backbone_checklist(species_list)
-
 # If there are any unmatched names, write these to a CSV
 unmatched <- backbone %>% filter(matchType %in% c("NONE", "HIGHERRANK"))
 if (nrow(unmatched) > 0) {
   log_msg(nrow(unmatched), " names did not cleanly match the GBIF backbone; see unmatched_names.csv")
   write_csv(unmatched, file.path(out_dir, "unmatched_names.csv"))
 }
-
 accepted <- backbone %>% filter(matchType %in% c("EXACT", "FUZZY"))
 
 # Detect input names that are synonyms in GBIF's backbone. For these, the
@@ -100,7 +97,7 @@ accepted <- backbone %>% filter(matchType %in% c("EXACT", "FUZZY"))
 # input name. We detect them via the 'synonym' column returned by
 # name_backbone_checklist(), and look up the accepted species name via
 # name_usage() so we can map input name -> GBIF accepted name.
-synonym_rows <- accepted %>% filter(synonym == TRUE)
+synonym_rows <- accepted %>% filter(status == "SYNONYM")
 name_lookup <- tibble(input_name = character(), gbif_name = character())
 if (nrow(synonym_rows) > 0) {
   name_lookup <- map_dfr(seq_len(nrow(synonym_rows)), function(i) {
@@ -115,14 +112,12 @@ if (nrow(synonym_rows) > 0) {
     }
   }) %>% filter(input_name != gbif_name) %>% distinct()
 }
-
 if (nrow(name_lookup) > 0) {
   log_msg(nrow(name_lookup), " input names are synonyms in GBIF's backbone:")
   for (i in seq_len(nrow(name_lookup))) {
     log_msg("  ", name_lookup$input_name[i], " -> ", name_lookup$gbif_name[i])
   }
 }
-
 log_msg(nrow(accepted), " of ", length(species_list),
         " species matched to a GBIF backbone accepted usage")
 
@@ -137,7 +132,6 @@ get_gbif_synonyms <- function(key) {
     unique(syn$canonicalName[!is.na(syn$canonicalName)])
   }, error = function(e) character(0))
 }
-
 get_pow_synonyms_optional <- function(sp) {
   tryCatch({
     syn_df <- taxize::synonyms(sp, db = "pow")[[1]]
@@ -147,23 +141,19 @@ get_pow_synonyms_optional <- function(sp) {
     unique(as.character(syn_df[[name_col]]))
   }, error = function(e) character(0))
 }
-
 log_msg("Enumerating synonyms for ", nrow(accepted), " species (", N_WORKERS, " workers)...")
-
 synonym_table <- accepted %>%
   select(species = verbatim_name, usageKey) %>%
   mutate(
     gbif_synonyms = future_map(usageKey, get_gbif_synonyms, .progress = FALSE),
     pow_synonyms  = future_map(species, get_pow_synonyms_optional, .progress = FALSE)
   )
-
 synonym_report <- synonym_table %>%
   mutate(
     gbif_synonyms = map_chr(gbif_synonyms, ~ paste(.x, collapse = "; ")),
     pow_synonyms  = map_chr(pow_synonyms, ~ paste(.x, collapse = "; "))
   )
 write_csv(synonym_report, file.path(out_dir, "synonym_mapping.csv"))
-
 gbif_keys <- unique(accepted$usageKey)
 log_msg(length(gbif_keys), " unique GBIF accepted taxon keys will be queried ",
         "(synonym occurrences are included automatically by GBIF's taxonKey filter)")
@@ -173,14 +163,10 @@ log_msg(length(gbif_keys), " unique GBIF accepted taxon keys will be queried ",
 # species at once. If a previous run already completed the download, skip
 # straight to loading the saved raw data (Step 6).
 raw_rds <- file.path(out_dir, "GBIF_occurrences_raw.rds")
-
 if (file.exists(raw_rds) && !FORCE_RERUN) {
-  
   log_msg("Found existing raw download at ", raw_rds, " -- loading from disk (skipping GBIF download)")
   dat_raw <- readRDS(raw_rds)
-  
 } else {
-  
   download_key <- occ_download(
     pred_in("taxonKey", gbif_keys),
     pred_in("country", countries),
@@ -250,27 +236,51 @@ dat <- dat %>%
 
 # ISO2 -> ISO3, required by cc_coun()
 dat$countryCode <- countrycode(dat$countryCode, origin = "iso2c", destination = "iso3c")
-
 dat <- as.data.frame(dat)
 dat$row_id <- seq_len(nrow(dat))   # stable index, used to realign parallel chunk results
-
 log_msg(nrow(dat), " records ready for cleaning")
 
 # %%% 7. CoordinateCleaner record-level tests -----------------------------------
 # cc_val/cc_equ/cc_cap/cc_cen/cc_coun/cc_sea/cc_zero/cc_dupl are single
 # vectorized passes over the whole table (not per-species loops), so they run
-# sequentially here.
+# sequentially here. Each test is run individually so per-species counts can be
+# recorded for the filtering summary.
 log_msg("Running record-level CoordinateCleaner tests...")
 
-clean <- dat %>%
-  cc_val() %>%
-  cc_equ() %>%
-  cc_cap() %>%
-  cc_cen() %>%
-  cc_coun(iso3 = "countryCode") %>%
-  cc_sea() %>%
-  cc_zero() %>%
-  cc_dupl()
+# Helper: per-species occurrence count
+count_by_species <- function(df) {
+  df %>% group_by(species) %>% summarise(n = n(), .groups = "drop") %>%
+    tibble::deframe()
+}
+step_counts <- list()
+step_counts[["after_geoprivacy"]] <- count_by_species(dat)
+
+clean <- cc_val(dat)
+step_counts[["after_cc_val"]] <- count_by_species(clean)
+
+clean <- cc_equ(clean)
+step_counts[["after_cc_equ"]] <- count_by_species(clean)
+
+clean <- cc_cap(clean)
+step_counts[["after_cc_cap"]] <- count_by_species(clean)
+
+clean <- cc_cen(clean)
+step_counts[["after_cc_cen"]] <- count_by_species(clean)
+
+clean <- cc_coun(clean, iso3 = "countryCode")
+step_counts[["after_cc_coun"]] <- count_by_species(clean)
+
+# Use 1:10m land polygons so that smaller islands (e.g. Channel Islands, Caribbean)
+# are included and their occurrences are not falsely flagged as at-sea.
+land_10m <- ne_download(scale = 10, type = "land", category = "physical", returnclass = "sf")
+clean <- cc_sea(clean, ref = land_10m)
+step_counts[["after_cc_sea"]] <- count_by_species(clean)
+
+clean <- cc_zero(clean)
+step_counts[["after_cc_zero"]] <- count_by_species(clean)
+
+clean <- cc_dupl(clean)
+step_counts[["after_cc_dupl"]] <- count_by_species(clean)
 
 log_msg(nrow(dat) - nrow(clean), " records removed by record-level tests; ", nrow(clean), " remaining")
 
@@ -301,6 +311,7 @@ clean <- clean %>%
   left_join(outl_flags, by = "row_id") %>%
   filter(outl_flag) %>%
   select(-outl_flag)
+step_counts[["after_cc_outl"]] <- count_by_species(clean)
 log_msg(nrow(clean), " records remaining after cc_outl()")
 
 # %%% 8. Coordinate precision filter --------------------------------------------
@@ -309,6 +320,7 @@ log_msg(nrow(clean), " records remaining after cc_outl()")
 clean <- clean %>%
   filter(is.na(coordinateUncertaintyInMeters) |
            (coordinateUncertaintyInMeters / 1000) <= coord_uncertainty_km)
+step_counts[["after_precision"]] <- count_by_species(clean)
 log_msg(nrow(clean), " records remaining after precision filter (<= ",
         coord_uncertainty_km, " km)")
 
@@ -349,8 +361,9 @@ if (file.exists(dataset_rds) && !FORCE_RERUN) {
     }, error = function(e) rep(TRUE, nrow(sub)))
     
     round_ds <- tryCatch({
-      cd_round(sub, lon = "decimalLongitude", lat = "decimalLatitude",
-               ds = "datasetKey", T1 = 7, value = "dataset", graphs = FALSE)
+      res <- cd_round(sub, lon = "decimalLongitude", lat = "decimalLatitude",
+                      ds = "datasetKey", T1 = 7, value = "dataset", graphs = FALSE)
+      tibble::rownames_to_column(res, var = "datasetKey")
     }, error = function(e) {
       message("  cd_round() failed for a chunk (", length(ds_chunk), " datasets): ", conditionMessage(e))
       NULL
@@ -373,6 +386,21 @@ if (file.exists(dataset_rds) && !FORCE_RERUN) {
   ddmm_flags   <- flags_all$ddmm_flag
   round_flags  <- flags_all$round_flag
   
+  # Map datasetKey -> species name(s) so the CSV is easier to interpret
+  ds_species_map <- clean %>%
+    distinct(datasetKey, species) %>%
+    group_by(datasetKey) %>%
+    summarise(species_names = paste(species, collapse = "; "), .groups = "drop")
+  if (!is.null(ddmm_report) && nrow(ddmm_report) > 0 && "datasetKey" %in% names(ddmm_report)) {
+    ddmm_report <- ddmm_report %>%
+      left_join(ds_species_map, by = "datasetKey") %>%
+      relocate(species_names, .before = 1)
+  }
+  if (!is.null(round_report) && nrow(round_report) > 0 && "datasetKey" %in% names(round_report)) {
+    round_report <- round_report %>%
+      left_join(ds_species_map, by = "datasetKey") %>%
+      relocate(species_names, .before = 1)
+  }
   write_csv(ddmm_report, file.path(out_dir, "ddmm_conversion_flags_by_dataset.csv"))
   write_csv(round_report, file.path(out_dir, "rasterized_sampling_flags_by_dataset.csv"))
   
@@ -385,10 +413,36 @@ if (file.exists(dataset_rds) && !FORCE_RERUN) {
 # NOTE: these are dataset-level tests, so review ddmm_conversion_flags_by_dataset.csv
 # and rasterized_sampling_flags_by_dataset.csv before treating this as final -
 # a flagged dataset may still contain a mix of good and bad records.
-clean_final <- clean[ddmm_flags & round_flags, ]
+clean_after_ddmm <- clean[ddmm_flags, ]
+step_counts[["after_cd_ddmm"]] <- count_by_species(clean_after_ddmm)
+
+clean_final <- clean_after_ddmm[round_flags[ddmm_flags], ]
+step_counts[["after_cd_round"]] <- count_by_species(clean_final)
+
 log_msg(nrow(clean) - nrow(clean_final),
         " records removed for belonging to a flagged dataset (ddmm/rasterized tests)")
 log_msg(nrow(clean_final), " final cleaned records")
+
+# %%% 9b. Write per-species filtering summary ------------------------------------
+# Build a CSV where each row is a species and each column shows the occurrence
+# count after each pipeline step, so it's clear where records are being lost.
+all_species <- unique(dat_raw$species)
+raw_counts <- dat_raw %>% group_by(species) %>% summarise(n = n(), .groups = "drop") %>%
+  tibble::deframe()
+
+filtering_summary <- tibble(species = all_species)
+filtering_summary$raw_download <- raw_counts[filtering_summary$species]
+for (step_name in names(step_counts)) {
+  filtering_summary[[step_name]] <- step_counts[[step_name]][filtering_summary$species]
+}
+
+# Replace NAs with 0 (species lost at that step have no rows remaining)
+filtering_summary <- filtering_summary %>%
+  mutate(across(-species, ~ replace_na(.x, 0L)))
+
+write_csv(filtering_summary, file.path(out_dir, "filtering_summary_by_species.csv"))
+log_msg("Filtering summary written to filtering_summary_by_species.csv (",
+        nrow(filtering_summary), " species)")
 
 # %%% 10. Save outputs -----------------------------------------------------------
 # Rename column names, into a format more useful for GFS
